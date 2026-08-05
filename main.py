@@ -9,6 +9,7 @@ import os
 import json
 import sqlite3
 import numpy as np
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Request
@@ -250,7 +251,6 @@ class PriceAnalyzer:
             self._build_df()
     
     def _build_df(self):
-        import pandas as pd
         self.df = pd.DataFrame(self.bars)
         self.df['ema20'] = self.df['close'].ewm(span=20, adjust=False).mean()
         self.df['ema50'] = self.df['close'].ewm(span=50, adjust=False).mean()
