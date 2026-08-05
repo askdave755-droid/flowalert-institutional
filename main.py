@@ -24,7 +24,7 @@ def get_db():
 def init_db():
     conn = get_db()
     c = conn.cursor()
-    
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS cot_data (
             id SERIAL PRIMARY KEY,
@@ -41,7 +41,7 @@ def init_db():
             UNIQUE(report_date, symbol)
         )
     ''')
-    
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS signals (
             id SERIAL PRIMARY KEY,
@@ -60,7 +60,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS price_snapshots (
             id SERIAL PRIMARY KEY,
@@ -74,7 +74,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
+
     conn.commit()
     conn.close()
 
@@ -127,7 +127,7 @@ class COTAnalyzer:
     def __init__(self, symbol: str):
         self.symbol = symbol
         self.cot_name = COT_SYMBOL_MAP.get(symbol, symbol)
-    
+
     def get_recent_cot(self, weeks: int = 4):
         conn = get_db()
         c = conn.cursor()
@@ -141,17 +141,17 @@ class COTAnalyzer:
         cols = [desc[0] for desc in c.description]
         conn.close()
         return [dict(zip(cols, r)) for r in rows]
-    
+
     def calculate_bias(self) -> Dict[str, Any]:
         data = self.get_recent_cot(weeks=4)
         if len(data) == 0:
             return {"bias": "NEUTRAL", "confidence": 0, "reason": "No COT data"}
-        
+
         latest = data[0]
         comm_net_now = latest['commercial_long'] - latest['commercial_short']
         noncomm_net_now = latest['noncomm_long'] - latest['noncomm_short']
         oi_now = latest['open_interest']
-        
+
         # Trend calculation: 2+ weeks preferred, 1 week uses absolute as fallback
         comm_trend = 0
         if len(data) >= 2:
@@ -161,13 +161,14 @@ class COTAnalyzer:
         else:
             # Single week fallback: treat absolute net as trend direction
             comm_trend = comm_net_now
-        
-        noncomm_extreme = abs(noncomm_net_now) / oi if oi > 0 else 0
-        
+
+        # FIX: was 'oi', now 'oi_now'
+        noncomm_extreme = abs(noncomm_net_now) / oi_now if oi_now > 0 else 0
+
         bias = "NEUTRAL"
         confidence = 50
         reasons = []
-        
+
         if comm_trend > 0:
             bias = "BULLISH"
             confidence += 20
@@ -176,7 +177,7 @@ class COTAnalyzer:
             bias = "BEARISH"
             confidence += 20
             reasons.append(f"Commercials distributing ({comm_trend:,} net)")
-        
+
         if noncomm_extreme > 0.25 and noncomm_net_now > 0:
             if bias == "BULLISH":
                 confidence -= 15
@@ -193,16 +194,16 @@ class COTAnalyzer:
                 bias = "BULLISH"
                 confidence = 75
                 reasons.append("Specs extreme short + commercials buying")
-        
+
         if comm_net_now > 0 and comm_trend >= 0:
             confidence += 10
             reasons.append("Commercials net long")
         elif comm_net_now < 0 and comm_trend <= 0:
             confidence += 10
             reasons.append("Commercials net short")
-        
+
         confidence = max(0, min(100, confidence))
-        
+
         return {
             "bias": bias,
             "confidence": confidence,
@@ -221,13 +222,13 @@ class PriceAnalyzer:
         self.df = None
         if len(bars) >= 20:
             self._build_df()
-    
+
     def _build_df(self):
         self.df = pd.DataFrame(self.bars)
         self.df['ema20'] = self.df['close'].ewm(span=20, adjust=False).mean()
         self.df['ema50'] = self.df['close'].ewm(span=50, adjust=False).mean()
         self.df['atr'] = self._calc_atr(14)
-    
+
     def _calc_atr(self, period: int) -> pd.Series:
         high_low = self.df['high'] - self.df['low']
         high_close = np.abs(self.df['high'] - self.df['close'].shift())
@@ -235,7 +236,7 @@ class PriceAnalyzer:
         ranges = pd.concat([high_low, high_close, low_close], axis=1)
         true_range = np.max(ranges, axis=1)
         return true_range.rolling(period).mean()
-    
+
     def get_trend(self) -> str:
         if self.df is None or len(self.df) < 20:
             return "NEUTRAL"
@@ -245,7 +246,7 @@ class PriceAnalyzer:
         elif last['close'] < last['ema20'] < last['ema50']:
             return "DOWNTREND"
         return "CHOPPY"
-    
+
     def get_structure(self) -> Dict:
         if self.df is None or len(self.df) < 10:
             return {"swing_high": None, "swing_low": None, "atr": 0}
@@ -265,7 +266,7 @@ class SignalGenerator:
         self.symbol = symbol
         self.cot = cot_analyzer
         self.price = price_analyzer
-    
+
     def generate(self) -> SignalResponse:
         now = datetime.utcnow().isoformat()
         cot_result = self.cot.calculate_bias()
@@ -273,14 +274,14 @@ class SignalGenerator:
         confidence = cot_result['confidence']
         price_trend = self.price.get_trend()
         structure = self.price.get_structure()
-        
+
         direction = "NONE"
         entry = None
         stop = None
         target = None
         size = 0.0
         reason = cot_result['reason']
-        
+
         if bias == "BULLISH" and price_trend in ["UPTREND", "CHOPPY"]:
             if structure['swing_low'] and structure['atr']:
                 direction = "LONG"
@@ -291,7 +292,7 @@ class SignalGenerator:
                 target = round(entry + (risk * 2), 2)
                 size = self._calculate_size(confidence)
                 reason += f" | Price: {price_trend}, Entry {entry}, Stop {stop}, Target {target}"
-        
+
         elif bias == "BEARISH" and price_trend in ["DOWNTREND", "CHOPPY"]:
             if structure['swing_high'] and structure['atr']:
                 direction = "SHORT"
@@ -302,10 +303,10 @@ class SignalGenerator:
                 target = round(entry - (risk * 2), 2)
                 size = self._calculate_size(confidence)
                 reason += f" | Price: {price_trend}, Entry {entry}, Stop {stop}, Target {target}"
-        
+
         else:
             reason += f" | Price trend {price_trend} conflicts with COT bias {bias}. NO TRADE."
-        
+
         conn = get_db()
         c = conn.cursor()
         c.execute(
@@ -316,13 +317,13 @@ class SignalGenerator:
         )
         conn.commit()
         conn.close()
-        
+
         return SignalResponse(
             timestamp=now, symbol=self.symbol, bias=bias, confidence=confidence,
             direction=direction, entry_price=entry, stop_price=stop,
             target_price=target, size_multiplier=size, reason=reason
         )
-    
+
     def _calculate_size(self, confidence: int) -> float:
         if confidence >= 80: return 2.0
         elif confidence >= 65: return 1.5
@@ -357,10 +358,10 @@ def update_cot(data: COTUpdate):
              data.open_interest)
         )
         conn.commit()
-        
+
         analyzer = COTAnalyzer(data.symbol)
         bias = analyzer.calculate_bias()
-        
+
         return {
             "status": "saved",
             "symbol": data.symbol,
@@ -402,9 +403,9 @@ def get_signal(symbol: str = "MES"):
     rows = c.fetchall()
     cols = [desc[0] for desc in c.description]
     conn.close()
-    
+
     bars = [dict(zip(cols, r)) for r in reversed(rows)]
-    
+
     if len(bars) < 20:
         return SignalResponse(
             timestamp=datetime.utcnow().isoformat(), symbol=symbol,
@@ -412,7 +413,7 @@ def get_signal(symbol: str = "MES"):
             entry_price=None, stop_price=None, target_price=None,
             size_multiplier=0, reason="Need at least 20 price bars. Send data to /ingest-price first."
         )
-    
+
     cot = COTAnalyzer(symbol)
     price = PriceAnalyzer(bars)
     gen = SignalGenerator(symbol, cot, price)
@@ -434,7 +435,7 @@ def get_signals(symbol: Optional[str] = None, limit: int = 20):
         params.append(symbol)
     query += " ORDER BY created_at DESC LIMIT %s"
     params.append(limit)
-    
+
     c.execute(query, params)
     rows = c.fetchall()
     cols = [desc[0] for desc in c.description]
@@ -448,29 +449,29 @@ def dashboard():
     c.execute("SELECT * FROM signals ORDER BY created_at DESC LIMIT 10")
     signals = c.fetchall()
     sig_cols = [desc[0] for desc in c.description]
-    
+
     c.execute("SELECT * FROM cot_data ORDER BY report_date DESC LIMIT 5")
     cot_rows = c.fetchall()
     cot_cols = [desc[0] for desc in c.description]
     conn.close()
-    
+
     signals_list = [dict(zip(sig_cols, r)) for r in signals]
     cot_list = [dict(zip(cot_cols, r)) for r in cot_rows]
-    
+
     signals_html = "".join([
         f"<tr><td>{s['timestamp'][:19]}</td><td>{s['symbol']}</td><td>{s['bias']}</td>"
         f"<td>{s['confidence']}%</td><td><b>{s['direction']}</b></td>"
         f"<td>{s['entry_price']}</td><td>{s['stop_price']}</td><td>{s['target_price']}</td></tr>"
         for s in signals_list
     ])
-    
+
     cot_html = "".join([
         f"<tr><td>{c['report_date']}</td><td>{c['symbol']}</td>"
         f"<td>{c['commercial_long']:,}</td><td>{c['commercial_short']:,}</td>"
         f"<td>{c['noncomm_long']:,}</td><td>{c['noncomm_short']:,}</td></tr>"
         for c in cot_list
     ])
-    
+
     return f"""
     <html><head><title>FlowAlert Institutional</title>
     <style>
