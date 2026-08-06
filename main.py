@@ -1,5 +1,6 @@
 """
-FlowAlert Institutional Monitor - PostgreSQL Version (Debug)
+FlowAlert Institutional Monitor - PostgreSQL Version (Configurable RR)
+Detects bank positioning via COT + Price Action for MES, NQ, GC
 """
 
 import os
@@ -10,12 +11,13 @@ import pandas as pd
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="FlowAlert Institutional", version="2.0-pg-debug")
+app = FastAPI(title="FlowAlert Institutional", version="2.0-pg-rr")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:QhhlQeZPzKzjFibjJhIjsrWPZKoAgtex@postgres.railway.internal:5432/railway")
+DEFAULT_RR = float(os.getenv("DEFAULT_RR_RATIO", "2.0"))
 
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -79,53 +81,53 @@ class COTAnalyzer:
     def __init__(self, symbol: str):
         self.symbol = symbol
         self.cot_name = COT_SYMBOL_MAP.get(symbol, symbol)
-    
+
     def get_recent_cot(self, weeks: int = 4):
         conn = get_db(); c = conn.cursor()
         c.execute("SELECT * FROM cot_data WHERE symbol = %s ORDER BY report_date DESC LIMIT %s", (self.symbol, weeks))
         rows = c.fetchall(); cols = [desc[0] for desc in c.description]
         conn.close()
         return [dict(zip(cols, r)) for r in rows]
-    
+
     def calculate_bias(self) -> Dict[str, Any]:
         data = self.get_recent_cot(weeks=4)
         if len(data) == 0:
             return {"bias": "NEUTRAL", "confidence": 0, "reason": "No COT data"}
-        
+
         latest = data[0]
         comm_net_now = int(latest['commercial_long']) - int(latest['commercial_short'])
         noncomm_net_now = int(latest['noncomm_long']) - int(latest['noncomm_short'])
         oi_now = int(latest['open_interest'])
-        
+
         comm_trend = comm_net_now
         if len(data) >= 2:
             prev = data[1]
             comm_net_prev = int(prev['commercial_long']) - int(prev['commercial_short'])
             comm_trend = comm_net_now - comm_net_prev
-        
+
         noncomm_extreme = abs(noncomm_net_now) / oi_now if oi_now > 0 else 0.0
-        
+
         bias = "NEUTRAL"; confidence = 50; reasons = []
-        
+
         if comm_trend > 0:
             bias = "BULLISH"; confidence += 20
             reasons.append(f"Commercials accumulating (+{comm_trend:,} net)")
         elif comm_trend < 0:
             bias = "BEARISH"; confidence += 20
             reasons.append(f"Commercials distributing ({comm_trend:,} net)")
-        
+
         if noncomm_extreme > 0.25 and noncomm_net_now > 0:
             if bias == "BULLISH": confidence -= 15; reasons.append("Specs overcrowded long (caution)")
             else: bias = "BEARISH"; confidence = 75; reasons.append("Specs extreme long + commercials selling")
         elif noncomm_extreme > 0.25 and noncomm_net_now < 0:
             if bias == "BEARISH": confidence -= 15; reasons.append("Specs overcrowded short (caution)")
             else: bias = "BULLISH"; confidence = 75; reasons.append("Specs extreme short + commercials buying")
-        
+
         if comm_net_now > 0 and comm_trend >= 0: confidence += 10; reasons.append("Commercials net long")
         elif comm_net_now < 0 and comm_trend <= 0: confidence += 10; reasons.append("Commercials net short")
-        
+
         confidence = max(0, min(100, confidence))
-        
+
         return {
             "bias": bias, "confidence": confidence,
             "commercial_net": comm_net_now, "commercial_trend": comm_trend,
@@ -144,9 +146,8 @@ class PriceAnalyzer:
             except Exception as e:
                 print(f"PriceAnalyzer build_df error: {e}")
                 self.df = None
-    
+
     def _build_df(self):
-        # Ensure all numeric columns are Python floats
         clean_bars = []
         for b in self.bars:
             clean_bars.append({
@@ -161,7 +162,7 @@ class PriceAnalyzer:
         self.df['ema20'] = self.df['close'].ewm(span=20, adjust=False).mean()
         self.df['ema50'] = self.df['close'].ewm(span=50, adjust=False).mean()
         self.df['atr'] = self._calc_atr(14)
-    
+
     def _calc_atr(self, period: int):
         high_low = self.df['high'] - self.df['low']
         high_close = np.abs(self.df['high'] - self.df['close'].shift())
@@ -169,7 +170,7 @@ class PriceAnalyzer:
         ranges = pd.concat([high_low, high_close, low_close], axis=1)
         true_range = np.max(ranges, axis=1)
         return true_range.rolling(period).mean()
-    
+
     def get_trend(self) -> str:
         if self.df is None or len(self.df) < 20:
             return "NEUTRAL"
@@ -178,21 +179,18 @@ class PriceAnalyzer:
         if c > e20 > e50: return "UPTREND"
         elif c < e20 < e50: return "DOWNTREND"
         return "CHOPPY"
-    
+
     def get_structure(self) -> Dict:
         if self.df is None or len(self.df) < 10:
             return {"swing_high": None, "swing_low": None, "atr": 0.0, "last_close": 0.0}
-        
         recent = self.df.tail(20)
         swing_high = float(recent['high'].max())
         swing_low = float(recent['low'].min())
-        
         atr_val = self.df['atr'].iloc[-1]
         if pd.isna(atr_val):
             atr = (swing_high - swing_low) * 0.1
         else:
             atr = float(atr_val)
-        
         return {
             "swing_high": round(swing_high, 2),
             "swing_low": round(swing_low, 2),
@@ -201,9 +199,12 @@ class PriceAnalyzer:
         }
 
 class SignalGenerator:
-    def __init__(self, symbol: str, cot_analyzer: COTAnalyzer, price_analyzer: PriceAnalyzer):
-        self.symbol = symbol; self.cot = cot_analyzer; self.price = price_analyzer
-    
+    def __init__(self, symbol: str, cot_analyzer: COTAnalyzer, price_analyzer: PriceAnalyzer, rr_ratio: float = DEFAULT_RR):
+        self.symbol = symbol
+        self.cot = cot_analyzer
+        self.price = price_analyzer
+        self.rr_ratio = rr_ratio
+
     def generate(self) -> SignalResponse:
         now = datetime.utcnow().isoformat()
         cot_result = self.cot.calculate_bias()
@@ -211,10 +212,10 @@ class SignalGenerator:
         confidence = cot_result['confidence']
         price_trend = self.price.get_trend()
         structure = self.price.get_structure()
-        
+
         direction = "NONE"; entry = None; stop = None; target = None; size = 0.0
         reason = cot_result['reason']
-        
+
         if bias == "BULLISH" and price_trend in ["UPTREND", "CHOPPY"]:
             if structure['swing_low'] and structure['atr'] and structure['atr'] > 0:
                 direction = "LONG"
@@ -222,10 +223,10 @@ class SignalGenerator:
                 stop = float(structure['swing_low']) - (float(structure['atr']) * 0.5)
                 stop = round(stop, 2)
                 risk = entry - stop
-                target = round(entry + (risk * 2), 2)
+                target = round(entry + (risk * self.rr_ratio), 2)
                 size = self._calculate_size(confidence)
-                reason += f" | Price: {price_trend}, Entry {entry}, Stop {stop}, Target {target}"
-        
+                reason += f" | Price: {price_trend}, Entry {entry}, Stop {stop}, Target {target} (RR {self.rr_ratio}:1)"
+
         elif bias == "BEARISH" and price_trend in ["DOWNTREND", "CHOPPY"]:
             if structure['swing_high'] and structure['atr'] and structure['atr'] > 0:
                 direction = "SHORT"
@@ -233,19 +234,18 @@ class SignalGenerator:
                 stop = float(structure['swing_high']) + (float(structure['atr']) * 0.5)
                 stop = round(stop, 2)
                 risk = stop - entry
-                target = round(entry - (risk * 2), 2)
+                target = round(entry - (risk * self.rr_ratio), 2)
                 size = self._calculate_size(confidence)
-                reason += f" | Price: {price_trend}, Entry {entry}, Stop {stop}, Target {target}"
-        
+                reason += f" | Price: {price_trend}, Entry {entry}, Stop {stop}, Target {target} (RR {self.rr_ratio}:1)"
+
         else:
             reason += f" | Price trend {price_trend} conflicts with COT bias {bias}. NO TRADE."
-        
-        # Cast everything to native Python types for PostgreSQL
+
         entry_f = float(entry) if entry is not None else None
         stop_f = float(stop) if stop is not None else None
         target_f = float(target) if target is not None else None
         size_f = float(size)
-        
+
         conn = get_db(); c = conn.cursor()
         c.execute(
             """INSERT INTO signals (timestamp, symbol, bias, confidence, direction, entry_price, stop_price, target_price, size_multiplier, reason)
@@ -253,13 +253,13 @@ class SignalGenerator:
             (now, self.symbol, bias, confidence, direction, entry_f, stop_f, target_f, size_f, reason)
         )
         conn.commit(); conn.close()
-        
+
         return SignalResponse(
             timestamp=now, symbol=self.symbol, bias=bias, confidence=confidence,
             direction=direction, entry_price=entry_f, stop_price=stop_f,
             target_price=target_f, size_multiplier=size_f, reason=reason
         )
-    
+
     def _calculate_size(self, confidence: int) -> float:
         if confidence >= 80: return 2.0
         elif confidence >= 65: return 1.5
@@ -268,7 +268,7 @@ class SignalGenerator:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "system": "FlowAlert Institutional", "version": "2.0-pg-debug"}
+    return {"status": "ok", "system": "FlowAlert Institutional", "version": "2.0-pg-rr", "db": "postgresql", "default_rr": DEFAULT_RR}
 
 @app.post("/update-cot")
 def update_cot(data: COTUpdate):
@@ -306,7 +306,7 @@ def ingest_price(data: PriceData):
     return {"status": "saved", "bars": len(data.bars), "symbol": data.symbol}
 
 @app.get("/signal", response_model=SignalResponse)
-def get_signal(symbol: str = "MES"):
+def get_signal(symbol: str = "MES", rr: float = DEFAULT_RR):
     try:
         conn = get_db(); c = conn.cursor()
         c.execute(
@@ -315,54 +315,42 @@ def get_signal(symbol: str = "MES"):
         )
         rows = c.fetchall(); cols = [desc[0] for desc in c.description]
         conn.close()
-        
+
         bars = [dict(zip(cols, r)) for r in reversed(rows)]
-        
+
         if len(bars) < 20:
             return SignalResponse(
                 timestamp=datetime.utcnow().isoformat(), symbol=symbol,
                 bias="NEUTRAL", confidence=0, direction="NONE",
                 entry_price=None, stop_price=None, target_price=None,
-                size_multiplier=0.0, reason=f"Need at least 20 price bars. Have {len(bars)}. Send data to /ingest-price first."
+                size_multiplier=0.0, reason=f"Need at least 20 price bars. Have {len(bars)}."
             )
-        
+
         cot = COTAnalyzer(symbol)
         price = PriceAnalyzer(bars)
-        gen = SignalGenerator(symbol, cot, price)
+        gen = SignalGenerator(symbol, cot, price, rr_ratio=rr)
         return gen.generate()
-    
     except Exception as e:
-        error_detail = f"{str(e)}\\n{traceback.format_exc()}"
+        error_detail = f"{str(e)}\n{traceback.format_exc()}"
         print(f"SIGNAL ERROR: {error_detail}")
         raise HTTPException(status_code=500, detail=error_detail)
 
 @app.get("/signal-debug")
 def signal_debug(symbol: str = "MES"):
-    """Debug endpoint - shows raw data without generating signal"""
     try:
         conn = get_db(); c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM price_snapshots WHERE symbol = %s", (symbol,))
         count = c.fetchone()[0]
-        
         c.execute(
             "SELECT timestamp as time, open, high, low, close, volume FROM price_snapshots WHERE symbol = %s ORDER BY timestamp DESC LIMIT 5",
             (symbol,)
         )
         rows = c.fetchall(); cols = [desc[0] for desc in c.description]
         conn.close()
-        
         recent = [dict(zip(cols, r)) for r in rows]
-        
         cot = COTAnalyzer(symbol)
         cot_bias = cot.calculate_bias()
-        
-        return {
-            "symbol": symbol,
-            "price_bar_count": count,
-            "recent_bars": recent,
-            "cot_bias": cot_bias,
-            "status": "ok"
-        }
+        return {"symbol": symbol, "price_bar_count": count, "recent_bars": recent, "cot_bias": cot_bias, "status": "ok"}
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc()}
 
@@ -390,24 +378,24 @@ def dashboard():
     c.execute("SELECT * FROM cot_data ORDER BY report_date DESC LIMIT 5")
     cot_rows = c.fetchall(); cot_cols = [desc[0] for desc in c.description]
     conn.close()
-    
+
     signals_list = [dict(zip(sig_cols, r)) for r in signals]
     cot_list = [dict(zip(cot_cols, r)) for r in cot_rows]
-    
+
     signals_html = "".join([
         f"<tr><td>{s['timestamp'][:19]}</td><td>{s['symbol']}</td><td>{s['bias']}</td>"
         f"<td>{s['confidence']}%</td><td><b>{s['direction']}</b></td>"
         f"<td>{s['entry_price']}</td><td>{s['stop_price']}</td><td>{s['target_price']}</td></tr>"
         for s in signals_list
     ])
-    
+
     cot_html = "".join([
         f"<tr><td>{c['report_date']}</td><td>{c['symbol']}</td>"
         f"<td>{c['commercial_long']:,}</td><td>{c['commercial_short']:,}</td>"
         f"<td>{c['noncomm_long']:,}</td><td>{c['noncomm_short']:,}</td></tr>"
         for c in cot_list
     ])
-    
+
     return f"""
     <html><head><title>FlowAlert Institutional</title>
     <style>
