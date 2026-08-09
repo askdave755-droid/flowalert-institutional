@@ -93,7 +93,7 @@ SYMBOLS = {
         "stop_ticks": 20,
         "target_ticks": 40,
         "atr_mult": 1.2,
-        "eia_day": 3,  # Wednesday
+        "eia_day": 3,
         "eia_time": "10:30",
     },
 }
@@ -108,7 +108,7 @@ class TradeLog(Base):
     __tablename__ = "trades"
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     symbol = Column(String, index=True)
-    direction = Column(String)  # LONG / SHORT / NONE
+    direction = Column(String)
     entry_price = Column(Float)
     stop_price = Column(Float)
     target_price = Column(Float)
@@ -118,7 +118,7 @@ class TradeLog(Base):
     filter_details = Column(Text)
     cot_bias = Column(String)
     macro_context = Column(Text)
-    result = Column(String, default="open")  # open / win / loss / breakeven
+    result = Column(String, default="open")
     pnl = Column(Float, default=0.0)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     closed_at = Column(DateTime, nullable=True)
@@ -206,11 +206,9 @@ class FREDClient:
         for name, sid in self.SERIES.items():
             context[name] = self._fetch(sid)
 
-        # Calculate WTI-Brent spread
         if context.get("wti") and context.get("brent"):
             context["spread"] = context["brent"] - context["wti"]
 
-        # Risk regime
         vix = context.get("vix", 20)
         context["risk_regime"] = (
             "extreme" if vix > 30 else
@@ -228,15 +226,6 @@ fred_client = FREDClient()
 # ─── SIX FILTER ENGINE ──────────────────────────────────────────────────────
 
 class SixFilterEngine:
-    """
-    1. LMSR - Price deviation from true VWAP
-    2. Kelly Criterion - Position sizing
-    3. EV Gap - Expected Value (2:1 RR minimum)
-    4. KL Divergence - Price/RSI divergence
-    5. Bayesian Updates - Context filter
-    6. Stoikov Execution - Limit order at VWAP/EMA confluence
-    """
-
     def __init__(self, symbol: str, bars: List[Dict]):
         self.symbol = symbol
         self.bars = bars
@@ -248,13 +237,11 @@ class SixFilterEngine:
         self.opens = np.array([b["open"] for b in bars])
 
     def true_vwap(self) -> float:
-        """Volume-weighted average price (typical price * volume)."""
         typical = (self.highs + self.lows + self.closes) / 3
         vol = self.volumes + 1e-9
         return np.sum(typical * vol) / np.sum(vol)
 
     def ema(self, period: int = 20) -> float:
-        """Exponential moving average."""
         if len(self.closes) < period:
             return float(np.mean(self.closes))
         weights = np.exp(np.linspace(-1, 0, period))
@@ -262,7 +249,6 @@ class SixFilterEngine:
         return float(np.convolve(self.closes[-period:], weights, mode="valid")[0])
 
     def atr(self, period: int = 14) -> float:
-        """Average True Range in ticks."""
         if len(self.closes) < 2:
             return self.config["avg_daily_range_ticks"] * 0.1
         tr1 = self.highs[1:] - self.lows[1:]
@@ -274,7 +260,6 @@ class SixFilterEngine:
         return atr_val / tick_size if tick_size > 0 else atr_val
 
     def rsi(self, period: int = 14) -> float:
-        """Relative Strength Index."""
         if len(self.closes) < period + 1:
             return 50.0
         deltas = np.diff(self.closes)
@@ -288,15 +273,11 @@ class SixFilterEngine:
         return 100 - (100 / (1 + rs))
 
     def lmsr_deviation(self) -> Dict:
-        """Filter 1: Logarithmic Market Scoring Rule deviation."""
         vwap = self.true_vwap()
         last_price = self.closes[-1]
         deviation = (last_price - vwap) / vwap if vwap != 0 else 0
-
-        # Normalized to -1 to 1
         threshold = 0.001 * self.config["atr_mult"]
         passed = abs(deviation) > threshold
-
         return {
             "name": "LMSR",
             "passed": passed,
@@ -306,10 +287,8 @@ class SixFilterEngine:
         }
 
     def kelly_criterion(self, win_rate: float = 0.55, rr: float = 2.0) -> Dict:
-        """Filter 2: Kelly fraction for position sizing."""
         kelly_f = (win_rate * rr - (1 - win_rate)) / rr if rr > 0 else 0
-        kelly_f = max(0, min(kelly_f, 0.25))  # Cap at 25%
-
+        kelly_f = max(0, min(kelly_f, 0.25))
         return {
             "name": "Kelly",
             "passed": kelly_f > 0.05,
@@ -318,14 +297,11 @@ class SixFilterEngine:
         }
 
     def ev_gap(self) -> Dict:
-        """Filter 3: Expected Value gap (2:1 minimum RR)."""
         atr_ticks = self.atr()
         stop_ticks = self.config["stop_ticks"]
         target_ticks = self.config["target_ticks"]
-
         rr = target_ticks / stop_ticks if stop_ticks > 0 else 0
         ev = (0.55 * target_ticks - 0.45 * stop_ticks) * self.config["tick_value"]
-
         return {
             "name": "EV_Gap",
             "passed": rr >= 2.0 and ev > 0,
@@ -335,20 +311,13 @@ class SixFilterEngine:
         }
 
     def kl_divergence(self) -> Dict:
-        """Filter 4: KL divergence between price and RSI momentum."""
         if len(self.closes) < 20:
             return {"name": "KL_Div", "passed": False, "value": 0, "direction": "NEUTRAL"}
-
         price_change = (self.closes[-1] - self.closes[-10]) / self.closes[-10] if self.closes[-10] != 0 else 0
         rsi_now = self.rsi()
-        rsi_then = 50.0  # Simplified
-
-        # Divergence: price up but RSI down = bearish, vice versa = bullish
         divergence = price_change * (rsi_now - 50) / 50
-
         passed = abs(divergence) > 0.02
         direction = "SHORT" if divergence > 0 else "LONG" if divergence < 0 else "NEUTRAL"
-
         return {
             "name": "KL_Div",
             "passed": passed,
@@ -357,32 +326,23 @@ class SixFilterEngine:
         }
 
     def bayesian_context(self, macro: Dict, cot_bias: str) -> Dict:
-        """Filter 5: Bayesian update with macro and COT context."""
-        prior = 0.5  # Neutral
-
-        # VIX adjustment
+        prior = 0.5
         vix = macro.get("vix", 20)
         if vix > 30:
-            prior *= 0.5  # High uncertainty
+            prior *= 0.5
         elif vix < 15:
-            prior *= 1.2  # Low vol, higher conviction
-
-        # COT adjustment
+            prior *= 1.2
         if cot_bias == "bullish":
             prior *= 1.15
         elif cot_bias == "bearish":
             prior *= 0.85
-
-        # Time of day (simplified)
         now = datetime.now(timezone.utc)
-        et_hour = (now.hour - 4) % 24  # Rough ET conversion
+        et_hour = (now.hour - 4) % 24
         if 9 <= et_hour <= 11:
-            prior *= 1.1  # Best session
+            prior *= 1.1
         elif 12 <= et_hour <= 13:
-            prior *= 0.7  # Lunch
-
+            prior *= 0.7
         posterior = min(prior, 0.95)
-
         return {
             "name": "Bayesian",
             "passed": posterior > 0.55,
@@ -391,23 +351,16 @@ class SixFilterEngine:
         }
 
     def stoikov_level(self) -> Dict:
-        """Filter 6: Optimal limit entry at VWAP/EMA confluence."""
         vwap = self.true_vwap()
         ema20 = self.ema(20)
         last = self.closes[-1]
-
-        # Confluence zone
         zone_low = min(vwap, ema20) * 0.999
         zone_high = max(vwap, ema20) * 1.001
-
         in_zone = zone_low <= last <= zone_high
-
-        # Direction based on trend
         direction = "LONG" if last > ema20 else "SHORT" if last < ema20 else "NEUTRAL"
-
         return {
             "name": "Stoikov",
-            "passed": in_zone or True,  # Always allow, but flag proximity
+            "passed": in_zone or True,
             "value": last,
             "entry_zone": (zone_low, zone_high),
             "direction": direction,
@@ -415,7 +368,6 @@ class SixFilterEngine:
         }
 
     def run_all(self, macro: Dict, cot_bias: str) -> Dict:
-        """Run all 6 filters and return composite signal."""
         f1 = self.lmsr_deviation()
         f2 = self.kelly_criterion()
         f3 = self.ev_gap()
@@ -426,7 +378,6 @@ class SixFilterEngine:
         filters = [f1, f2, f3, f4, f5, f6]
         passed = sum(1 for f in filters if f["passed"])
 
-        # Direction consensus
         directions = [f.get("direction", "NEUTRAL") for f in filters if f.get("direction")]
         long_votes = directions.count("LONG")
         short_votes = directions.count("SHORT")
@@ -438,15 +389,11 @@ class SixFilterEngine:
         else:
             direction = "NONE"
 
-        # Confidence = passed filters / 6 * Bayesian posterior
         base_confidence = passed / 6.0
         bayesian_conf = f5["value"]
         confidence = min(base_confidence * bayesian_conf * 100, 95)
-
-        # Only trade if 4+ filters align and confidence >= 70%
         should_trade = passed >= 4 and confidence >= 70 and direction != "NONE"
 
-        # Calculate levels
         last = self.closes[-1]
         tick = self.config["tick_size"]
         stop_dist = self.config["stop_ticks"] * tick
@@ -471,7 +418,7 @@ class SixFilterEngine:
             "entry_price": round(last, 2) if should_trade else None,
             "stop_price": round(stop, 2) if should_trade else None,
             "target_price": round(target, 2) if should_trade else None,
-            "size": max(1, int(f2["size_fraction"] * 4)),  # Scale 1-4 contracts
+            "size": max(1, int(f2["size_fraction"] * 4)),
             "filter_details": filters,
             "vwap": round(vwap, 2),
             "ema20": round(ema20, 2),
@@ -481,41 +428,34 @@ class SixFilterEngine:
 # ─── TIME FILTERS ───────────────────────────────────────────────────────────
 
 def check_time_filters(symbol: str) -> tuple[bool, str]:
-    """Returns (allowed, reason)."""
     cfg = SYMBOLS.get(symbol)
     if not cfg or not cfg.get("enabled"):
         return False, "Symbol disabled"
 
     now = datetime.now(timezone.utc)
-    # Approximate ET (UTC-4 or UTC-5 depending on DST)
-    et_offset = timedelta(hours=4)  # Simplified
+    et_offset = timedelta(hours=4)
     et_now = now - et_offset
     et_time = et_now.strftime("%H:%M")
     et_weekday = et_now.weekday()
 
-    # Weekend
     if et_weekday >= 5:
         return False, "Weekend"
 
-    # Session hours
     start = cfg.get("session_start")
     end = cfg.get("session_end")
     if start and end:
         if not (start <= et_time <= end):
             return False, f"Outside session {start}-{end}"
 
-    # Lunch ban
     lunch = cfg.get("lunch_ban")
     if lunch:
         if lunch[0] <= et_time <= lunch[1]:
             return False, f"Lunch ban {lunch[0]}-{lunch[1]}"
 
-    # EIA special for MCL
     if symbol == "MCL":
-        eia_day = cfg.get("eia_day", 3)  # Wednesday
+        eia_day = cfg.get("eia_day", 3)
         if et_weekday == eia_day:
             eia_time = cfg.get("eia_time", "10:30")
-            # Allow 10:25-11:00 for volatility
             if not ("10:25" <= et_time <= "11:00"):
                 return False, "MCL: Waiting for EIA 10:30 AM"
 
@@ -524,7 +464,6 @@ def check_time_filters(symbol: str) -> tuple[bool, str]:
 # ─── COT MANAGEMENT ─────────────────────────────────────────────────────────
 
 def get_cot_bias(symbol: str, db: Session) -> str:
-    """Get latest COT bias for symbol."""
     record = db.query(COTRecord).filter(COTRecord.symbol == symbol).order_by(COTRecord.report_date.desc()).first()
     if not record:
         return "neutral"
@@ -532,8 +471,6 @@ def get_cot_bias(symbol: str, db: Session) -> str:
     comm_net = record.commercial_long - record.commercial_short
     noncomm_net = record.noncommercial_long - record.noncommercial_short
 
-    # Commercials net long = bullish (they're hedging by being long)
-    # In practice for financials: Asset Managers long = bullish
     if comm_net > 0 and noncomm_net < 0:
         return "bullish"
     elif comm_net < 0 and noncomm_net > 0:
@@ -543,7 +480,6 @@ def get_cot_bias(symbol: str, db: Session) -> str:
 # ─── RISK MANAGEMENT ────────────────────────────────────────────────────────
 
 def check_daily_limits(symbol: str, db: Session) -> tuple[bool, str]:
-    """Check prop firm daily limits."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     stats = db.query(DailyStats).filter(
         DailyStats.date == today,
@@ -576,7 +512,7 @@ class BarData(BaseModel):
     timestamp: Optional[str] = None
 
 class AnalyzeRequest(BaseModel):
-    symbol: str = Field(..., regex="^(MES|NQ|MCL)$")
+    symbol: str = Field(..., pattern="^(MES|NQ|MCL)$")
     bars: List[BarData]
     account_balance: float = 25000.0
     daily_pnl: float = 0.0
@@ -588,7 +524,7 @@ class COTUpdateRequest(BaseModel):
 
 class TradeResultRequest(BaseModel):
     trade_id: str
-    result: str  # win / loss / breakeven
+    result: str
     exit_price: float
     pnl: float
 
@@ -613,28 +549,21 @@ async def macro_context():
 async def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks, db: Session = next(get_db())):
     symbol = request.symbol.upper()
 
-    # Time filter
     time_ok, time_reason = check_time_filters(symbol)
     if not time_ok:
         return {"symbol": symbol, "direction": "NONE", "reason": time_reason, "confidence": 0}
 
-    # Daily limits
     limit_ok, limit_reason = check_daily_limits(symbol, db)
     if not limit_ok:
         return {"symbol": symbol, "direction": "NONE", "reason": limit_reason, "confidence": 0}
 
-    # COT bias
     cot_bias = get_cot_bias(symbol, db)
-
-    # Macro context
     macro = fred_client.get_macro_context()
 
-    # Run SixFilter
-    bars_dict = [b.dict() for b in request.bars]
+    bars_dict = [b.model_dump() for b in request.bars]
     engine = SixFilterEngine(symbol, bars_dict)
     signal = engine.run_all(macro, cot_bias)
 
-    # Log if trade signal
     if signal["direction"] != "NONE":
         trade = TradeLog(
             symbol=symbol,
@@ -653,7 +582,6 @@ async def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks, db
         db.commit()
         signal["trade_id"] = trade.id
 
-        # Update daily stats
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         stats = db.query(DailyStats).filter(DailyStats.date == today, DailyStats.symbol == symbol).first()
         if not stats:
@@ -675,7 +603,6 @@ async def trade_result(request: TradeResultRequest, db: Session = next(get_db())
     trade.closed_at = datetime.now(timezone.utc)
     db.commit()
 
-    # Update daily stats
     today = trade.created_at.strftime("%Y-%m-%d")
     stats = db.query(DailyStats).filter(DailyStats.date == today, DailyStats.symbol == trade.symbol).first()
     if stats:
@@ -713,8 +640,7 @@ async def update_cot(request: COTUpdateRequest, db: Session = next(get_db())):
     return {"status": "ok", "updated": len(request.markets), "report_date": request.report_date}
 
 @app.get("/signal-debug")
-async def signal_debug(symbol: str = Query(..., regex="^(MES|NQ|MCL)$"), db: Session = next(get_db())):
-    """Debug endpoint showing why a signal was generated or blocked."""
+async def signal_debug(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$"), db: Session = next(get_db())):
     time_ok, time_reason = check_time_filters(symbol)
     limit_ok, limit_reason = check_daily_limits(symbol, db)
     cot_bias = get_cot_bias(symbol, db)
