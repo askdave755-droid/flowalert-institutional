@@ -1,22 +1,18 @@
 """
-FlowAlert Institutional v3.0
-SixFilter + FRED Macro + Prop Firm Risk Management
-Symbols: MES (core), NQ (tech beta), MCL (oil diversifier)
+FlowAlert Institutional v3.1 — Clean Rebuild
+Drops stale tables, recreates fresh schema on startup.
 """
 
 import os
 import json
-import math
 import uuid
-import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
-from enum import Enum
 
 import requests
 import numpy as np
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Depends
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, String, Float, DateTime, Boolean, Integer, Text
@@ -28,7 +24,7 @@ from sqlalchemy.orm import sessionmaker, Session
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("flowalert")
 
-app = FastAPI(title="FlowAlert Institutional", version="3.0.0")
+app = FastAPI(title="FlowAlert Institutional", version="3.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,12 +32,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Environment
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost/flowalert")
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Prop Firm Config (Bulenox)
 PROP_CONFIG = {
     "starting_balance": 25000.0,
     "trailing_drawdown": 1500.0,
@@ -50,7 +43,6 @@ PROP_CONFIG = {
     "max_trades_per_day": 3,
 }
 
-# Symbol Configs
 SYMBOLS = {
     "MES": {
         "enabled": True,
@@ -98,7 +90,7 @@ SYMBOLS = {
     },
 }
 
-# ─── DATABASE ───────────────────────────────────────────────────────────────
+# ─── DATABASE — NUCLEAR RESET ON STARTUP ────────────────────────────────────
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -140,15 +132,20 @@ class COTRecord(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     report_date = Column(String, index=True)
     symbol = Column(String, index=True)
-    commercial_long = Column(Float)
-    commercial_short = Column(Float)
-    noncommercial_long = Column(Float)
-    noncommercial_short = Column(Float)
-    open_interest = Column(Float)
-    net_change = Column(Float)
+    commercial_long = Column(Float, default=0)
+    commercial_short = Column(Float, default=0)
+    noncommercial_long = Column(Float, default=0)
+    noncommercial_short = Column(Float, default=0)
+    open_interest = Column(Float, default=0)
+    net_change = Column(Float, default=0)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+# NUCLEAR: Drop all tables and recreate fresh
+logger.info("NUCLEAR RESET: Dropping all tables...")
+Base.metadata.drop_all(bind=engine)
+logger.info("NUCLEAR RESET: Recreating tables...")
 Base.metadata.create_all(bind=engine)
+logger.info("NUCLEAR RESET: Database is fresh.")
 
 def get_db():
     db = SessionLocal()
@@ -161,7 +158,6 @@ def get_db():
 
 class FREDClient:
     BASE = "https://api.stlouisfed.org/fred/series/observations"
-
     SERIES = {
         "wti": "DCOILWTICO",
         "brent": "DCOILBRENTEU",
@@ -234,12 +230,11 @@ class SixFilterEngine:
         self.highs = np.array([b["high"] for b in bars])
         self.lows = np.array([b["low"] for b in bars])
         self.volumes = np.array([b.get("volume", 0) for b in bars])
-        self.opens = np.array([b["open"] for b in bars])
 
     def true_vwap(self) -> float:
         typical = (self.highs + self.lows + self.closes) / 3
         vol = self.volumes + 1e-9
-        return np.sum(typical * vol) / np.sum(vol)
+        return float(np.sum(typical * vol) / np.sum(vol))
 
     def ema(self, period: int = 20) -> float:
         if len(self.closes) < period:
@@ -395,6 +390,8 @@ class SixFilterEngine:
         should_trade = passed >= 4 and confidence >= 70 and direction != "NONE"
 
         last = self.closes[-1]
+        vwap = self.true_vwap()
+        ema20 = self.ema(20)
         tick = self.config["tick_size"]
         stop_dist = self.config["stop_ticks"] * tick
         target_dist = self.config["target_ticks"] * tick
@@ -433,7 +430,7 @@ def check_time_filters(symbol: str) -> tuple[bool, str]:
         return False, "Symbol disabled"
 
     now = datetime.now(timezone.utc)
-    et_offset = timedelta(hours=4)
+    et_offset = __import__("datetime").timedelta(hours=4)
     et_now = now - et_offset
     et_time = et_now.strftime("%H:%M")
     et_weekday = et_now.weekday()
@@ -535,7 +532,7 @@ async def health():
     macro = fred_client.get_macro_context()
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbols": {s: {"enabled": c["enabled"]} for s, c in SYMBOLS.items()},
         "fred": {"connected": bool(macro.get("vix")), "risk_regime": macro.get("risk_regime", "unknown")},
@@ -561,8 +558,8 @@ async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
     macro = fred_client.get_macro_context()
 
     bars_dict = [b.model_dump() for b in request.bars]
-    engine = SixFilterEngine(symbol, bars_dict)
-    signal = engine.run_all(macro, cot_bias)
+    engine_filter = SixFilterEngine(symbol, bars_dict)
+    signal = engine_filter.run_all(macro, cot_bias)
 
     if signal["direction"] != "NONE":
         trade = TradeLog(
