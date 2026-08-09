@@ -694,6 +694,85 @@ async def bias(symbol: str, db: Session = Depends(get_db)):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
+
+# ─── NT8 COMPATIBILITY CACHE ────────────────────────────────────────────────
+
+from fastapi import Request
+
+# In-memory cache: symbol -> list of bars
+_price_cache: Dict[str, List[Dict]] = {}
+_last_analysis: Dict[str, Dict] = {}
+
+class IngestPriceRequest(BaseModel):
+    symbol: str
+    bars: List[Dict[str, Any]]
+
+@app.post("/ingest-price")
+async def ingest_price(request: IngestPriceRequest, db: Session = Depends(get_db)):
+    """NT8 compatibility: stores bars, returns OK immediately."""
+    symbol = request.symbol.upper()
+    _price_cache[symbol] = request.bars
+
+    # Also run analysis immediately and cache result
+    cot_bias = get_cot_bias(symbol, db)
+    macro = fred_client.get_macro_context()
+
+    try:
+        engine_filter = SixFilterEngine(symbol, request.bars)
+        signal = engine_filter.run_all(macro, cot_bias)
+        _last_analysis[symbol] = signal
+    except Exception as e:
+        logger.warning(f"Analysis failed for {symbol}: {e}")
+        _last_analysis[symbol] = {
+            "symbol": symbol,
+            "direction": "NONE",
+            "raw_direction": "NONE",
+            "confidence": 0,
+            "filters_passed": 0,
+            "filters_total": 6,
+            "entry_price": None,
+            "stop_price": None,
+            "target_price": None,
+            "size": 1,
+            "filter_details": [],
+            "vwap": 0,
+            "ema20": 0,
+            "atr_ticks": 0,
+        }
+
+    return {"status": "ok", "bars_received": len(request.bars)}
+
+@app.get("/signal")
+async def get_signal(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$"), db: Session = Depends(get_db)):
+    """NT8 compatibility: returns cached signal for symbol."""
+    symbol = symbol.upper()
+
+    # If we have cached analysis, return it
+    if symbol in _last_analysis:
+        sig = _last_analysis[symbol]
+        return {
+            "direction": sig.get("direction", "NONE"),
+            "bias": get_cot_bias(symbol, db),
+            "confidence": sig.get("confidence", 0),
+            "entry_price": sig.get("entry_price", 0),
+            "stop_price": sig.get("stop_price", 0),
+            "target_price": sig.get("target_price", 0),
+            "size_multiplier": 1.0,
+            "reason": "",
+        }
+
+    # No cached data — return neutral
+    return {
+        "direction": "NONE",
+        "bias": get_cot_bias(symbol, db),
+        "confidence": 0,
+        "entry_price": 0,
+        "stop_price": 0,
+        "target_price": 0,
+        "size_multiplier": 1.0,
+        "reason": "No price data ingested yet",
+    }
+
 # ─── MAIN ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
