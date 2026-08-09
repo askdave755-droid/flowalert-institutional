@@ -16,7 +16,7 @@ from enum import Enum
 
 import requests
 import numpy as np
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, String, Float, DateTime, Boolean, Integer, Text
@@ -546,7 +546,7 @@ async def macro_context():
     return fred_client.get_macro_context()
 
 @app.post("/analyze")
-async def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks, db: Session = next(get_db())):
+async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
     symbol = request.symbol.upper()
 
     time_ok, time_reason = check_time_filters(symbol)
@@ -593,7 +593,7 @@ async def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks, db
     return signal
 
 @app.post("/trade-result")
-async def trade_result(request: TradeResultRequest, db: Session = next(get_db())):
+async def trade_result(request: TradeResultRequest, db: Session = Depends(get_db)):
     trade = db.query(TradeLog).filter(TradeLog.id == request.trade_id).first()
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
@@ -618,7 +618,7 @@ async def trade_result(request: TradeResultRequest, db: Session = next(get_db())
     return {"status": "ok", "trade_id": request.trade_id, "pnl": request.pnl}
 
 @app.post("/update-cot")
-async def update_cot(request: COTUpdateRequest, db: Session = next(get_db())):
+async def update_cot(request: COTUpdateRequest, db: Session = Depends(get_db)):
     for market in request.markets:
         symbol = market.get("market", "")
         if symbol not in SYMBOLS:
@@ -640,7 +640,7 @@ async def update_cot(request: COTUpdateRequest, db: Session = next(get_db())):
     return {"status": "ok", "updated": len(request.markets), "report_date": request.report_date}
 
 @app.get("/signal-debug")
-async def signal_debug(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$"), db: Session = next(get_db())):
+async def signal_debug(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$"), db: Session = Depends(get_db)):
     time_ok, time_reason = check_time_filters(symbol)
     limit_ok, limit_reason = check_daily_limits(symbol, db)
     cot_bias = get_cot_bias(symbol, db)
@@ -656,7 +656,7 @@ async def signal_debug(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$"), db: S
     }
 
 @app.get("/daily-stats")
-async def daily_stats(symbol: Optional[str] = None, db: Session = next(get_db())):
+async def daily_stats(symbol: Optional[str] = None, db: Session = Depends(get_db)):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     query = db.query(DailyStats).filter(DailyStats.date == today)
     if symbol:
@@ -665,7 +665,7 @@ async def daily_stats(symbol: Optional[str] = None, db: Session = next(get_db())
     return [{"symbol": s.symbol, "trades": s.trades_taken, "pnl": s.daily_pnl, "wins": s.wins, "losses": s.losses} for s in stats]
 
 @app.get("/recent-trades")
-async def recent_trades(symbol: Optional[str] = None, limit: int = 20, db: Session = next(get_db())):
+async def recent_trades(symbol: Optional[str] = None, limit: int = 20, db: Session = Depends(get_db)):
     query = db.query(TradeLog).order_by(TradeLog.created_at.desc())
     if symbol:
         query = query.filter(TradeLog.symbol == symbol)
@@ -684,7 +684,7 @@ async def recent_trades(symbol: Optional[str] = None, limit: int = 20, db: Sessi
     } for t in trades]
 
 @app.get("/bias/{symbol}")
-async def bias(symbol: str, db: Session = next(get_db())):
+async def bias(symbol: str, db: Session = Depends(get_db)):
     if symbol not in SYMBOLS:
         raise HTTPException(status_code=400, detail="Invalid symbol")
     cot = get_cot_bias(symbol, db)
