@@ -1,6 +1,6 @@
 """
-FlowAlert Institutional v3.2 — Bulletproof Rebuild
-Survives DB failures, FRED failures, and any runtime crash.
+FlowAlert Institutional v3.3 — Emergency Strip-Down
+NO database. NO nuclear reset. Pure in-memory. Guaranteed to start.
 """
 
 import os
@@ -10,16 +10,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
-# ─── CONFIG ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("flowalert")
 
-app = FastAPI(title="FlowAlert Institutional", version="3.2.0")
+app = FastAPI(title="FlowAlert Institutional", version="3.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,7 +25,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 
 PROP_CONFIG = {
@@ -85,86 +82,13 @@ SYMBOLS = {
     },
 }
 
-# ─── DATABASE (Fail-Safe) ─────────────────────────────────────────────────
+# ─── IN-MEMORY ONLY ─────────────────────────────────────────────────────────
 
-db_available = False
-engine = None
-SessionLocal = None
-Base = None
-
-try:
-    from sqlalchemy import create_engine, Column, String, Float, DateTime, Boolean, Integer, Text
-    from sqlalchemy.ext.declarative import declarative_base
-    from sqlalchemy.orm import sessionmaker, Session
-
-    if DATABASE_URL and DATABASE_URL.startswith("postgresql"):
-        engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"connect_timeout": 5})
-        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        Base = declarative_base()
-
-        class TradeLog(Base):
-            __tablename__ = "trades"
-            id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-            symbol = Column(String, index=True)
-            direction = Column(String)
-            entry_price = Column(Float)
-            stop_price = Column(Float)
-            target_price = Column(Float)
-            size = Column(Integer)
-            confidence = Column(Float)
-            filters_passed = Column(Integer)
-            filter_details = Column(Text)
-            cot_bias = Column(String)
-            macro_context = Column(Text)
-            result = Column(String, default="open")
-            pnl = Column(Float, default=0.0)
-            created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-            closed_at = Column(DateTime, nullable=True)
-
-        class DailyStats(Base):
-            __tablename__ = "daily_stats"
-            id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-            date = Column(String, index=True)
-            symbol = Column(String, index=True)
-            trades_taken = Column(Integer, default=0)
-            wins = Column(Integer, default=0)
-            losses = Column(Integer, default=0)
-            daily_pnl = Column(Float, default=0.0)
-            max_drawdown = Column(Float, default=0.0)
-            hit_daily_limit = Column(Boolean, default=False)
-
-        class COTRecord(Base):
-            __tablename__ = "cot_data"
-            id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-            report_date = Column(String, index=True)
-            symbol = Column(String, index=True)
-            commercial_long = Column(Float, default=0)
-            commercial_short = Column(Float, default=0)
-            noncommercial_long = Column(Float, default=0)
-            noncommercial_short = Column(Float, default=0)
-            open_interest = Column(Float, default=0)
-            net_change = Column(Float, default=0)
-            created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-
-        Base.metadata.drop_all(bind=engine)
-        Base.metadata.create_all(bind=engine)
-        db_available = True
-        logger.info("Database connected and initialized.")
-    else:
-        logger.warning("DATABASE_URL not set or invalid. Running without DB.")
-except Exception as e:
-    logger.error(f"Database failed to initialize: {e}")
-    db_available = False
-
-def get_db():
-    if not db_available or SessionLocal is None:
-        yield None
-        return
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+_price_cache: Dict[str, List[Dict]] = {}
+_last_analysis: Dict[str, Dict] = {}
+_cot_memory: Dict[str, Dict] = {}
+_trade_log: List[Dict] = []
+_daily_stats: Dict[str, Dict] = {}
 
 # ─── FRED CLIENT (Fail-Safe) ────────────────────────────────────────────────
 
@@ -232,12 +156,6 @@ class FREDClient:
 
 fred_client = FREDClient()
 
-# ─── IN-MEMORY CACHES FOR NT8 COMPAT ────────────────────────────────────────
-
-_price_cache: Dict[str, List[Dict]] = {}
-_last_analysis: Dict[str, Dict] = {}
-_cot_memory: Dict[str, Dict] = {}
-
 # ─── TIME FILTERS ───────────────────────────────────────────────────────────
 
 def check_time_filters(symbol: str) -> tuple[bool, str]:
@@ -276,7 +194,7 @@ def check_time_filters(symbol: str) -> tuple[bool, str]:
 
 # ─── COT MANAGEMENT ─────────────────────────────────────────────────────────
 
-def get_cot_bias(symbol: str, db) -> str:
+def get_cot_bias(symbol: str) -> str:
     if symbol in _cot_memory:
         record = _cot_memory[symbol]
         comm_net = record.get("commercial_long", 0) - record.get("commercial_short", 0)
@@ -285,60 +203,28 @@ def get_cot_bias(symbol: str, db) -> str:
             return "bullish"
         elif comm_net < 0 and noncomm_net > 0:
             return "bearish"
-
-    if db_available and db is not None:
-        try:
-            record = db.query(COTRecord).filter(COTRecord.symbol == symbol).order_by(COTRecord.report_date.desc()).first()
-            if record:
-                comm_net = record.commercial_long - record.commercial_short
-                noncomm_net = record.noncommercial_long - record.noncommercial_short
-                if comm_net > 0 and noncomm_net < 0:
-                    return "bullish"
-                elif comm_net < 0 and noncomm_net > 0:
-                    return "bearish"
-        except Exception as e:
-            logger.warning(f"DB COT query failed: {e}")
-
     return "neutral"
 
 # ─── RISK MANAGEMENT ────────────────────────────────────────────────────────
 
-def check_daily_limits(symbol: str, db) -> tuple[bool, str]:
-    if not db_available or db is None:
-        return True, "OK (no DB)"
-
+def check_daily_limits(symbol: str) -> tuple[bool, str]:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    try:
-        stats = db.query(DailyStats).filter(
-            DailyStats.date == today,
-            DailyStats.symbol == symbol
-        ).first()
+    key = f"{today}_{symbol}"
+    stats = _daily_stats.get(key)
 
-        if not stats:
-            return True, "OK"
+    if not stats:
+        return True, "OK"
 
-        cfg = SYMBOLS[symbol]
-        if stats.trades_taken >= cfg["max_trades"]:
-            return False, f"Max trades reached ({cfg['max_trades']})"
+    cfg = SYMBOLS[symbol]
+    if stats.get("trades_taken", 0) >= cfg["max_trades"]:
+        return False, f"Max trades reached ({cfg['max_trades']})"
 
-        if stats.daily_pnl <= -PROP_CONFIG["daily_loss_limit"]:
-            return False, f"Daily loss limit hit (${stats.daily_pnl:.0f})"
-
-        if stats.hit_daily_limit:
-            return False, "Daily limit flag set"
-    except Exception as e:
-        logger.warning(f"Daily limits check failed: {e}")
+    if stats.get("daily_pnl", 0) <= -PROP_CONFIG["daily_loss_limit"]:
+        return False, f"Daily loss limit hit (${stats['daily_pnl']:.0f})"
 
     return True, "OK"
 
-# ─── SIX FILTER ENGINE (Lightweight) ────────────────────────────────────────
-
-try:
-    import numpy as np
-    NUMPY_OK = True
-except Exception:
-    NUMPY_OK = False
-    logger.warning("numpy not available — using pure Python math")
+# ─── SIX FILTER ENGINE (Pure Python) ────────────────────────────────────────
 
 class SixFilterEngine:
     def __init__(self, symbol: str, bars: List[Dict]):
@@ -401,9 +287,11 @@ class SixFilterEngine:
         return 100 - (100 / (1 + rs))
 
     def run_all(self, macro: Dict, cot_bias: str) -> Dict:
-        # Filter 1: LMSR
         vwap = self.true_vwap()
         last = self.closes[-1]
+        ema20 = self.ema(20)
+
+        # Filter 1: LMSR
         deviation = (last - vwap) / vwap if vwap != 0 else 0
         threshold = 0.001 * self.config["atr_mult"]
         f1_passed = abs(deviation) > threshold
@@ -427,6 +315,7 @@ class SixFilterEngine:
         # Filter 4: KL Divergence
         f4_passed = False
         f4_dir = "NEUTRAL"
+        divergence = 0
         if len(self.closes) >= 20:
             price_change = (self.closes[-1] - self.closes[-10]) / self.closes[-10] if self.closes[-10] != 0 else 0
             rsi_now = self.rsi()
@@ -455,7 +344,6 @@ class SixFilterEngine:
         f5_passed = posterior > 0.55
 
         # Filter 6: Stoikov
-        ema20 = self.ema(20)
         zone_low = min(vwap, ema20) * 0.999
         zone_high = max(vwap, ema20) * 1.001
         in_zone = zone_low <= last <= zone_high
@@ -466,7 +354,7 @@ class SixFilterEngine:
             {"name": "LMSR", "passed": f1_passed, "value": deviation, "direction": f1_dir},
             {"name": "Kelly", "passed": f2_passed, "value": kelly_f, "size_fraction": kelly_f},
             {"name": "EV_Gap", "passed": f3_passed, "value": ev, "rr_ratio": rr_calc, "atr_ticks": atr_ticks},
-            {"name": "KL_Div", "passed": f4_passed, "value": divergence if len(self.closes) >= 20 else 0, "direction": f4_dir},
+            {"name": "KL_Div", "passed": f4_passed, "value": divergence, "direction": f4_dir},
             {"name": "Bayesian", "passed": f5_passed, "value": posterior, "confidence": posterior},
             {"name": "Stoikov", "passed": f6_passed, "value": last, "direction": f6_dir, "in_zone": in_zone},
         ]
@@ -530,9 +418,6 @@ class BarData(BaseModel):
 class AnalyzeRequest(BaseModel):
     symbol: str = Field(..., pattern="^(MES|NQ|MCL)$")
     bars: List[BarData]
-    account_balance: float = 25000.0
-    daily_pnl: float = 0.0
-    consecutive_losses: int = 0
 
 class COTUpdateRequest(BaseModel):
     report_date: str
@@ -555,11 +440,11 @@ async def health():
     macro = fred_client.get_macro_context()
     return {
         "status": "ok",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbols": {s: {"enabled": c["enabled"]} for s, c in SYMBOLS.items()},
         "fred": {"connected": bool(macro.get("vix")), "risk_regime": macro.get("risk_regime", "unknown")},
-        "db": db_available,
+        "mode": "in-memory-only",
     }
 
 @app.get("/macro-context")
@@ -567,33 +452,21 @@ async def macro_context():
     return fred_client.get_macro_context()
 
 @app.post("/ingest-price")
-async def ingest_price(request: IngestPriceRequest, db: Session = Depends(get_db)):
-    """NT8 compatibility: stores bars, runs analysis, caches signal."""
+async def ingest_price(request: IngestPriceRequest):
     symbol = request.symbol.upper()
 
-    # TIME GUARD — reject if outside session
     time_ok, time_reason = check_time_filters(symbol)
     if not time_ok:
         _last_analysis[symbol] = {
-            "symbol": symbol,
-            "direction": "NONE",
-            "raw_direction": "NONE",
-            "confidence": 0,
-            "filters_passed": 0,
-            "filters_total": 6,
-            "entry_price": None,
-            "stop_price": None,
-            "target_price": None,
-            "size": 1,
-            "filter_details": [],
-            "vwap": 0,
-            "ema20": 0,
-            "atr_ticks": 0,
+            "symbol": symbol, "direction": "NONE", "raw_direction": "NONE",
+            "confidence": 0, "filters_passed": 0, "filters_total": 6,
+            "entry_price": None, "stop_price": None, "target_price": None,
+            "size": 1, "filter_details": [], "vwap": 0, "ema20": 0, "atr_ticks": 0,
         }
         return {"status": "ok", "bars_received": len(request.bars), "reason": time_reason}
 
     _price_cache[symbol] = request.bars
-    cot_bias = get_cot_bias(symbol, db)
+    cot_bias = get_cot_bias(symbol)
     macro = fred_client.get_macro_context()
 
     try:
@@ -603,185 +476,120 @@ async def ingest_price(request: IngestPriceRequest, db: Session = Depends(get_db
     except Exception as e:
         logger.warning(f"Analysis failed for {symbol}: {e}")
         _last_analysis[symbol] = {
-            "symbol": symbol,
-            "direction": "NONE",
-            "raw_direction": "NONE",
-            "confidence": 0,
-            "filters_passed": 0,
-            "filters_total": 6,
-            "entry_price": None,
-            "stop_price": None,
-            "target_price": None,
-            "size": 1,
-            "filter_details": [],
-            "vwap": 0,
-            "ema20": 0,
-            "atr_ticks": 0,
+            "symbol": symbol, "direction": "NONE", "raw_direction": "NONE",
+            "confidence": 0, "filters_passed": 0, "filters_total": 6,
+            "entry_price": None, "stop_price": None, "target_price": None,
+            "size": 1, "filter_details": [], "vwap": 0, "ema20": 0, "atr_ticks": 0,
         }
 
     return {"status": "ok", "bars_received": len(request.bars)}
 
 @app.get("/signal")
-async def get_signal(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$"), db: Session = Depends(get_db)):
-    """NT8 compatibility: returns cached signal for symbol."""
+async def get_signal(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$")):
     symbol = symbol.upper()
 
-    # TIME GUARD
     time_ok, time_reason = check_time_filters(symbol)
     if not time_ok:
         return {
-            "direction": "NONE",
-            "bias": get_cot_bias(symbol, db),
-            "confidence": 0,
-            "entry_price": 0,
-            "stop_price": 0,
-            "target_price": 0,
-            "size_multiplier": 1.0,
-            "reason": time_reason,
+            "direction": "NONE", "bias": get_cot_bias(symbol),
+            "confidence": 0, "entry_price": 0, "stop_price": 0,
+            "target_price": 0, "size_multiplier": 1.0, "reason": time_reason,
         }
 
     if symbol in _last_analysis:
         sig = _last_analysis[symbol]
         return {
             "direction": sig.get("direction", "NONE"),
-            "bias": get_cot_bias(symbol, db),
+            "bias": get_cot_bias(symbol),
             "confidence": sig.get("confidence", 0),
-            "entry_price": sig.get("entry_price", 0),
-            "stop_price": sig.get("stop_price", 0),
-            "target_price": sig.get("target_price", 0),
+            "entry_price": sig.get("entry_price", 0) or 0,
+            "stop_price": sig.get("stop_price", 0) or 0,
+            "target_price": sig.get("target_price", 0) or 0,
             "size_multiplier": 1.0,
             "reason": "",
         }
 
     return {
-        "direction": "NONE",
-        "bias": get_cot_bias(symbol, db),
-        "confidence": 0,
-        "entry_price": 0,
-        "stop_price": 0,
-        "target_price": 0,
-        "size_multiplier": 1.0,
+        "direction": "NONE", "bias": get_cot_bias(symbol),
+        "confidence": 0, "entry_price": 0, "stop_price": 0,
+        "target_price": 0, "size_multiplier": 1.0,
         "reason": "No price data ingested yet",
     }
 
 @app.post("/analyze")
-async def analyze(request: AnalyzeRequest, db: Session = Depends(get_db)):
+async def analyze(request: AnalyzeRequest):
     symbol = request.symbol.upper()
 
     time_ok, time_reason = check_time_filters(symbol)
     if not time_ok:
         return {"symbol": symbol, "direction": "NONE", "reason": time_reason, "confidence": 0}
 
-    limit_ok, limit_reason = check_daily_limits(symbol, db)
+    limit_ok, limit_reason = check_daily_limits(symbol)
     if not limit_ok:
         return {"symbol": symbol, "direction": "NONE", "reason": limit_reason, "confidence": 0}
 
-    cot_bias = get_cot_bias(symbol, db)
+    cot_bias = get_cot_bias(symbol)
     macro = fred_client.get_macro_context()
 
     bars_dict = [b.model_dump() for b in request.bars]
     engine_filter = SixFilterEngine(symbol, bars_dict)
     signal = engine_filter.run_all(macro, cot_bias)
 
-    if signal["direction"] != "NONE" and db_available and db is not None:
-        try:
-            trade = TradeLog(
-                symbol=symbol,
-                direction=signal["direction"],
-                entry_price=signal["entry_price"],
-                stop_price=signal["stop_price"],
-                target_price=signal["target_price"],
-                size=signal["size"],
-                confidence=signal["confidence"],
-                filters_passed=signal["filters_passed"],
-                filter_details=json.dumps(signal["filter_details"]),
-                cot_bias=cot_bias,
-                macro_context=json.dumps(macro),
-            )
-            db.add(trade)
-            db.commit()
-            signal["trade_id"] = trade.id
+    if signal["direction"] != "NONE":
+        trade_id = str(uuid.uuid4())
+        signal["trade_id"] = trade_id
+        _trade_log.append({
+            "id": trade_id, "symbol": symbol, "direction": signal["direction"],
+            "entry_price": signal["entry_price"], "stop_price": signal["stop_price"],
+            "target_price": signal["target_price"], "size": signal["size"],
+            "confidence": signal["confidence"], "created_at": datetime.now(timezone.utc).isoformat(),
+        })
 
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            stats = db.query(DailyStats).filter(DailyStats.date == today, DailyStats.symbol == symbol).first()
-            if not stats:
-                stats = DailyStats(date=today, symbol=symbol)
-                db.add(stats)
-            stats.trades_taken += 1
-            db.commit()
-        except Exception as e:
-            logger.warning(f"DB logging failed: {e}")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = f"{today}_{symbol}"
+        if key not in _daily_stats:
+            _daily_stats[key] = {"trades_taken": 0, "wins": 0, "losses": 0, "daily_pnl": 0.0}
+        _daily_stats[key]["trades_taken"] += 1
 
     return signal
 
 @app.post("/trade-result")
-async def trade_result(request: TradeResultRequest, db: Session = Depends(get_db)):
-    if not db_available or db is None:
-        return {"status": "ok", "trade_id": request.trade_id, "pnl": request.pnl, "note": "no DB"}
+async def trade_result(request: TradeResultRequest):
+    for t in _trade_log:
+        if t["id"] == request.trade_id:
+            t["result"] = request.result
+            t["pnl"] = request.pnl
+            t["closed_at"] = datetime.now(timezone.utc).isoformat()
 
-    try:
-        trade = db.query(TradeLog).filter(TradeLog.id == request.trade_id).first()
-        if not trade:
-            raise HTTPException(status_code=404, detail="Trade not found")
-
-        trade.result = request.result
-        trade.pnl = request.pnl
-        trade.closed_at = datetime.now(timezone.utc)
-        db.commit()
-
-        today = trade.created_at.strftime("%Y-%m-%d")
-        stats = db.query(DailyStats).filter(DailyStats.date == today, DailyStats.symbol == trade.symbol).first()
-        if stats:
-            stats.daily_pnl += request.pnl
-            if request.result == "win":
-                stats.wins += 1
-            elif request.result == "loss":
-                stats.losses += 1
-                if stats.daily_pnl <= -PROP_CONFIG["daily_loss_limit"]:
-                    stats.hit_daily_limit = True
-            db.commit()
-    except Exception as e:
-        logger.warning(f"Trade result update failed: {e}")
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            key = f"{today}_{t['symbol']}"
+            if key in _daily_stats:
+                _daily_stats[key]["daily_pnl"] += request.pnl
+                if request.result == "win":
+                    _daily_stats[key]["wins"] += 1
+                elif request.result == "loss":
+                    _daily_stats[key]["losses"] += 1
+            break
 
     return {"status": "ok", "trade_id": request.trade_id, "pnl": request.pnl}
 
 @app.post("/update-cot")
-async def update_cot(request: COTUpdateRequest, db: Session = Depends(get_db)):
+async def update_cot(request: COTUpdateRequest):
     updated = 0
     for market in request.markets:
         symbol = market.get("market", "")
         if symbol not in SYMBOLS:
             continue
-
         _cot_memory[symbol] = market
-
-        if db_available and db is not None:
-            try:
-                record = COTRecord(
-                    report_date=request.report_date,
-                    symbol=symbol,
-                    commercial_long=market.get("commercial_long", 0),
-                    commercial_short=market.get("commercial_short", 0),
-                    noncommercial_long=market.get("non_commercial_long", 0),
-                    noncommercial_short=market.get("non_commercial_short", 0),
-                    open_interest=market.get("open_interest", 0),
-                    net_change=market.get("net_change", 0),
-                )
-                db.add(record)
-                db.commit()
-                updated += 1
-            except Exception as e:
-                logger.warning(f"COT DB insert failed for {symbol}: {e}")
-        else:
-            updated += 1
+        updated += 1
 
     return {"status": "ok", "updated": updated, "report_date": request.report_date}
 
 @app.get("/signal-debug")
-async def signal_debug(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$"), db: Session = Depends(get_db)):
+async def signal_debug(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$")):
     time_ok, time_reason = check_time_filters(symbol)
-    limit_ok, limit_reason = check_daily_limits(symbol, db)
-    cot_bias = get_cot_bias(symbol, db)
+    limit_ok, limit_reason = check_daily_limits(symbol)
+    cot_bias = get_cot_bias(symbol)
     macro = fred_client.get_macro_context()
 
     return {
@@ -794,50 +602,30 @@ async def signal_debug(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$"), db: S
     }
 
 @app.get("/daily-stats")
-async def daily_stats(symbol: Optional[str] = None, db: Session = Depends(get_db)):
-    if not db_available or db is None:
-        return [{"note": "Database not available"}]
-
+async def daily_stats(symbol: Optional[str] = None):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    try:
-        query = db.query(DailyStats).filter(DailyStats.date == today)
-        if symbol:
-            query = query.filter(DailyStats.symbol == symbol)
-        stats = query.all()
-        return [{"symbol": s.symbol, "trades": s.trades_taken, "pnl": s.daily_pnl, "wins": s.wins, "losses": s.losses} for s in stats]
-    except Exception as e:
-        return [{"error": str(e)}]
+    results = []
+    for key, stats in _daily_stats.items():
+        if key.startswith(today):
+            parts = key.split("_")
+            sym = parts[1] if len(parts) > 1 else "unknown"
+            if symbol and sym != symbol:
+                continue
+            results.append({"symbol": sym, "trades": stats["trades_taken"], "pnl": stats["daily_pnl"], "wins": stats["wins"], "losses": stats["losses"]})
+    return results
 
 @app.get("/recent-trades")
-async def recent_trades(symbol: Optional[str] = None, limit: int = 20, db: Session = Depends(get_db)):
-    if not db_available or db is None:
-        return [{"note": "Database not available"}]
-
-    try:
-        query = db.query(TradeLog).order_by(TradeLog.created_at.desc())
-        if symbol:
-            query = query.filter(TradeLog.symbol == symbol)
-        trades = query.limit(limit).all()
-        return [{
-            "id": t.id,
-            "symbol": t.symbol,
-            "direction": t.direction,
-            "entry": t.entry_price,
-            "stop": t.stop_price,
-            "target": t.target_price,
-            "confidence": t.confidence,
-            "result": t.result,
-            "pnl": t.pnl,
-            "created_at": t.created_at.isoformat(),
-        } for t in trades]
-    except Exception as e:
-        return [{"error": str(e)}]
+async def recent_trades(symbol: Optional[str] = None, limit: int = 20):
+    trades = list(reversed(_trade_log))
+    if symbol:
+        trades = [t for t in trades if t.get("symbol") == symbol]
+    return trades[:limit]
 
 @app.get("/bias/{symbol}")
-async def bias(symbol: str, db: Session = Depends(get_db)):
+async def bias(symbol: str):
     if symbol not in SYMBOLS:
-        raise HTTPException(status_code=400, detail="Invalid symbol")
-    cot = get_cot_bias(symbol, db)
+        return {"error": "Invalid symbol"}
+    cot = get_cot_bias(symbol)
     macro = fred_client.get_macro_context()
     return {
         "symbol": symbol,
