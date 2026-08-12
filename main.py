@@ -1,12 +1,10 @@
 """
-FlowAlert Institutional v3.3 — Emergency Strip-Down
-NO database. NO nuclear reset. Pure in-memory. Guaranteed to start.
+FlowAlert Institutional v3.4 — Unkillable
+Hardcoded COT. No FRED. No DB. Zero external dependencies.
 """
 
 import os
 import json
-import uuid
-import logging
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
@@ -14,10 +12,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("flowalert")
-
-app = FastAPI(title="FlowAlert Institutional", version="3.3.0")
+app = FastAPI(title="FlowAlert Institutional", version="3.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,15 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FRED_API_KEY = os.getenv("FRED_API_KEY", "")
-
-PROP_CONFIG = {
-    "starting_balance": 25000.0,
-    "trailing_drawdown": 1500.0,
-    "daily_loss_limit": 1000.0,
-    "profit_target": 1500.0,
-    "max_trades_per_day": 3,
-}
+# ─── HARDCODED CONFIG ───────────────────────────────────────────────────────
 
 SYMBOLS = {
     "MES": {
@@ -82,79 +69,18 @@ SYMBOLS = {
     },
 }
 
-# ─── IN-MEMORY ONLY ─────────────────────────────────────────────────────────
+# HARDCODED COT — never needs reloading
+COT_DATA = {
+    "MES": {"commercial_long": 1144294, "commercial_short": 203822, "noncommercial_long": 135454, "noncommercial_short": 500456, "bias": "bullish"},
+    "NQ": {"commercial_long": 106744, "commercial_short": 32681, "noncommercial_long": 47577, "noncommercial_short": 111740, "bias": "bullish"},
+    "MCL": {"commercial_long": 41017, "commercial_short": 255805, "noncommercial_long": 227310, "noncommercial_short": 40628, "bias": "bearish"},
+}
 
+# In-memory only
 _price_cache: Dict[str, List[Dict]] = {}
 _last_analysis: Dict[str, Dict] = {}
-_cot_memory: Dict[str, Dict] = {}
 _trade_log: List[Dict] = []
 _daily_stats: Dict[str, Dict] = {}
-
-# ─── FRED CLIENT (Fail-Safe) ────────────────────────────────────────────────
-
-class FREDClient:
-    BASE = "https://api.stlouisfed.org/fred/series/observations"
-    SERIES = {
-        "wti": "DCOILWTICO",
-        "brent": "DCOILBRENTEU",
-        "dxy": "DTWEXBGS",
-        "ten_year": "DGS10",
-        "vix": "VIXCLS",
-        "fed_funds": "DFF",
-    }
-
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or FRED_API_KEY
-        self._cache = {}
-        self._cache_time = None
-
-    def _fetch(self, series_id: str) -> Optional[float]:
-        try:
-            import requests
-            r = requests.get(
-                self.BASE,
-                params={
-                    "series_id": series_id,
-                    "api_key": self.api_key,
-                    "file_type": "json",
-                    "sort_order": "desc",
-                    "limit": 1,
-                },
-                timeout=3,
-            )
-            data = r.json()
-            obs = data.get("observations", [])
-            if obs and obs[0].get("value") != ".":
-                return float(obs[0]["value"])
-        except Exception:
-            pass
-        return None
-
-    def get_macro_context(self) -> Dict[str, Any]:
-        now = datetime.now(timezone.utc)
-        if self._cache_time and (now - self._cache_time).seconds < 300:
-            return self._cache
-
-        context = {}
-        for name, sid in self.SERIES.items():
-            context[name] = self._fetch(sid)
-
-        if context.get("wti") and context.get("brent"):
-            context["spread"] = context["brent"] - context["wti"]
-
-        vix = context.get("vix", 20)
-        context["risk_regime"] = (
-            "extreme" if vix and vix > 30 else
-            "high" if vix and vix > 25 else
-            "elevated" if vix and vix > 20 else
-            "normal"
-        )
-
-        self._cache = context
-        self._cache_time = now
-        return context
-
-fred_client = FREDClient()
 
 # ─── TIME FILTERS ───────────────────────────────────────────────────────────
 
@@ -192,39 +118,27 @@ def check_time_filters(symbol: str) -> tuple[bool, str]:
 
     return True, "OK"
 
-# ─── COT MANAGEMENT ─────────────────────────────────────────────────────────
+# ─── COT ────────────────────────────────────────────────────────────────────
 
 def get_cot_bias(symbol: str) -> str:
-    if symbol in _cot_memory:
-        record = _cot_memory[symbol]
-        comm_net = record.get("commercial_long", 0) - record.get("commercial_short", 0)
-        noncomm_net = record.get("noncommercial_long", 0) - record.get("noncommercial_short", 0)
-        if comm_net > 0 and noncomm_net < 0:
-            return "bullish"
-        elif comm_net < 0 and noncomm_net > 0:
-            return "bearish"
-    return "neutral"
+    return COT_DATA.get(symbol, {}).get("bias", "neutral")
 
-# ─── RISK MANAGEMENT ────────────────────────────────────────────────────────
+# ─── RISK ───────────────────────────────────────────────────────────────────
 
 def check_daily_limits(symbol: str) -> tuple[bool, str]:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     key = f"{today}_{symbol}"
     stats = _daily_stats.get(key)
-
     if not stats:
         return True, "OK"
-
     cfg = SYMBOLS[symbol]
     if stats.get("trades_taken", 0) >= cfg["max_trades"]:
         return False, f"Max trades reached ({cfg['max_trades']})"
-
-    if stats.get("daily_pnl", 0) <= -PROP_CONFIG["daily_loss_limit"]:
+    if stats.get("daily_pnl", 0) <= -1000:
         return False, f"Daily loss limit hit (${stats['daily_pnl']:.0f})"
-
     return True, "OK"
 
-# ─── SIX FILTER ENGINE (Pure Python) ────────────────────────────────────────
+# ─── SIX FILTER (Pure Python) ───────────────────────────────────────────────
 
 class SixFilterEngine:
     def __init__(self, symbol: str, bars: List[Dict]):
@@ -286,25 +200,19 @@ class SixFilterEngine:
         rs = avg_g / avg_l
         return 100 - (100 / (1 + rs))
 
-    def run_all(self, macro: Dict, cot_bias: str) -> Dict:
+    def run_all(self, cot_bias: str) -> Dict:
         vwap = self.true_vwap()
         last = self.closes[-1]
         ema20 = self.ema(20)
 
-        # Filter 1: LMSR
         deviation = (last - vwap) / vwap if vwap != 0 else 0
         threshold = 0.001 * self.config["atr_mult"]
         f1_passed = abs(deviation) > threshold
         f1_dir = "LONG" if deviation < -threshold else "SHORT" if deviation > threshold else "NEUTRAL"
 
-        # Filter 2: Kelly
-        win_rate = 0.55
-        rr = 2.0
-        kelly_f = (win_rate * rr - (1 - win_rate)) / rr if rr > 0 else 0
-        kelly_f = max(0, min(kelly_f, 0.25))
-        f2_passed = kelly_f > 0.05
+        kelly_f = 0.15
+        f2_passed = True
 
-        # Filter 3: EV Gap
         atr_ticks = self.atr()
         stop_ticks = self.config["stop_ticks"]
         target_ticks = self.config["target_ticks"]
@@ -312,7 +220,6 @@ class SixFilterEngine:
         ev = (0.55 * target_ticks - 0.45 * stop_ticks) * self.config["tick_value"]
         f3_passed = rr_calc >= 2.0 and ev > 0
 
-        # Filter 4: KL Divergence
         f4_passed = False
         f4_dir = "NEUTRAL"
         divergence = 0
@@ -323,13 +230,7 @@ class SixFilterEngine:
             f4_passed = abs(divergence) > 0.02
             f4_dir = "SHORT" if divergence > 0 else "LONG" if divergence < 0 else "NEUTRAL"
 
-        # Filter 5: Bayesian
         prior = 0.5
-        vix = macro.get("vix", 20)
-        if vix and vix > 30:
-            prior *= 0.5
-        elif vix and vix < 15:
-            prior *= 1.2
         if cot_bias == "bullish":
             prior *= 1.15
         elif cot_bias == "bearish":
@@ -343,7 +244,6 @@ class SixFilterEngine:
         posterior = min(prior, 0.95)
         f5_passed = posterior > 0.55
 
-        # Filter 6: Stoikov
         zone_low = min(vwap, ema20) * 0.999
         zone_high = max(vwap, ema20) * 1.001
         in_zone = zone_low <= last <= zone_high
@@ -405,7 +305,7 @@ class SixFilterEngine:
             "atr_ticks": round(atr_ticks, 1),
         }
 
-# ─── API MODELS ─────────────────────────────────────────────────────────────
+# ─── MODELS ─────────────────────────────────────────────────────────────────
 
 class BarData(BaseModel):
     open: float
@@ -413,15 +313,14 @@ class BarData(BaseModel):
     low: float
     close: float
     volume: int = 0
-    timestamp: Optional[str] = None
 
 class AnalyzeRequest(BaseModel):
     symbol: str = Field(..., pattern="^(MES|NQ|MCL)$")
     bars: List[BarData]
 
-class COTUpdateRequest(BaseModel):
-    report_date: str
-    markets: List[Dict[str, Any]]
+class IngestPriceRequest(BaseModel):
+    symbol: str
+    bars: List[Dict[str, Any]]
 
 class TradeResultRequest(BaseModel):
     trade_id: str
@@ -429,32 +328,22 @@ class TradeResultRequest(BaseModel):
     exit_price: float
     pnl: float
 
-class IngestPriceRequest(BaseModel):
-    symbol: str
-    bars: List[Dict[str, Any]]
-
 # ─── ENDPOINTS ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    macro = fred_client.get_macro_context()
     return {
         "status": "ok",
-        "version": "3.3.0",
+        "version": "3.4.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbols": {s: {"enabled": c["enabled"]} for s, c in SYMBOLS.items()},
-        "fred": {"connected": bool(macro.get("vix")), "risk_regime": macro.get("risk_regime", "unknown")},
-        "mode": "in-memory-only",
+        "cot": {s: COT_DATA[s]["bias"] for s in COT_DATA},
+        "mode": "hardcoded-unkillable",
     }
-
-@app.get("/macro-context")
-async def macro_context():
-    return fred_client.get_macro_context()
 
 @app.post("/ingest-price")
 async def ingest_price(request: IngestPriceRequest):
     symbol = request.symbol.upper()
-
     time_ok, time_reason = check_time_filters(symbol)
     if not time_ok:
         _last_analysis[symbol] = {
@@ -467,14 +356,12 @@ async def ingest_price(request: IngestPriceRequest):
 
     _price_cache[symbol] = request.bars
     cot_bias = get_cot_bias(symbol)
-    macro = fred_client.get_macro_context()
 
     try:
-        engine_filter = SixFilterEngine(symbol, request.bars)
-        signal = engine_filter.run_all(macro, cot_bias)
+        engine = SixFilterEngine(symbol, request.bars)
+        signal = engine.run_all(cot_bias)
         _last_analysis[symbol] = signal
     except Exception as e:
-        logger.warning(f"Analysis failed for {symbol}: {e}")
         _last_analysis[symbol] = {
             "symbol": symbol, "direction": "NONE", "raw_direction": "NONE",
             "confidence": 0, "filters_passed": 0, "filters_total": 6,
@@ -487,7 +374,6 @@ async def ingest_price(request: IngestPriceRequest):
 @app.get("/signal")
 async def get_signal(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$")):
     symbol = symbol.upper()
-
     time_ok, time_reason = check_time_filters(symbol)
     if not time_ok:
         return {
@@ -519,7 +405,6 @@ async def get_signal(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$")):
 @app.post("/analyze")
 async def analyze(request: AnalyzeRequest):
     symbol = request.symbol.upper()
-
     time_ok, time_reason = check_time_filters(symbol)
     if not time_ok:
         return {"symbol": symbol, "direction": "NONE", "reason": time_reason, "confidence": 0}
@@ -529,14 +414,12 @@ async def analyze(request: AnalyzeRequest):
         return {"symbol": symbol, "direction": "NONE", "reason": limit_reason, "confidence": 0}
 
     cot_bias = get_cot_bias(symbol)
-    macro = fred_client.get_macro_context()
-
     bars_dict = [b.model_dump() for b in request.bars]
-    engine_filter = SixFilterEngine(symbol, bars_dict)
-    signal = engine_filter.run_all(macro, cot_bias)
+    engine = SixFilterEngine(symbol, bars_dict)
+    signal = engine.run_all(cot_bias)
 
     if signal["direction"] != "NONE":
-        trade_id = str(uuid.uuid4())
+        trade_id = str(__import__("uuid").uuid4())
         signal["trade_id"] = trade_id
         _trade_log.append({
             "id": trade_id, "symbol": symbol, "direction": signal["direction"],
@@ -544,7 +427,6 @@ async def analyze(request: AnalyzeRequest):
             "target_price": signal["target_price"], "size": signal["size"],
             "confidence": signal["confidence"], "created_at": datetime.now(timezone.utc).isoformat(),
         })
-
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         key = f"{today}_{symbol}"
         if key not in _daily_stats:
@@ -560,7 +442,6 @@ async def trade_result(request: TradeResultRequest):
             t["result"] = request.result
             t["pnl"] = request.pnl
             t["closed_at"] = datetime.now(timezone.utc).isoformat()
-
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             key = f"{today}_{t['symbol']}"
             if key in _daily_stats:
@@ -570,34 +451,21 @@ async def trade_result(request: TradeResultRequest):
                 elif request.result == "loss":
                     _daily_stats[key]["losses"] += 1
             break
-
     return {"status": "ok", "trade_id": request.trade_id, "pnl": request.pnl}
 
 @app.post("/update-cot")
-async def update_cot(request: COTUpdateRequest):
-    updated = 0
-    for market in request.markets:
-        symbol = market.get("market", "")
-        if symbol not in SYMBOLS:
-            continue
-        _cot_memory[symbol] = market
-        updated += 1
-
-    return {"status": "ok", "updated": updated, "report_date": request.report_date}
+async def update_cot(request: Dict[str, Any]):
+    return {"status": "ok", "note": "COT is hardcoded — no update needed", "hardcoded_bias": {s: COT_DATA[s]["bias"] for s in COT_DATA}}
 
 @app.get("/signal-debug")
 async def signal_debug(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$")):
     time_ok, time_reason = check_time_filters(symbol)
     limit_ok, limit_reason = check_daily_limits(symbol)
-    cot_bias = get_cot_bias(symbol)
-    macro = fred_client.get_macro_context()
-
     return {
         "symbol": symbol,
         "time_filter": {"allowed": time_ok, "reason": time_reason},
         "risk_filter": {"allowed": limit_ok, "reason": limit_reason},
-        "cot_bias": cot_bias,
-        "macro_context": macro,
+        "cot_bias": get_cot_bias(symbol),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -625,17 +493,11 @@ async def recent_trades(symbol: Optional[str] = None, limit: int = 20):
 async def bias(symbol: str):
     if symbol not in SYMBOLS:
         return {"error": "Invalid symbol"}
-    cot = get_cot_bias(symbol)
-    macro = fred_client.get_macro_context()
     return {
         "symbol": symbol,
-        "cot_bias": cot,
-        "vix": macro.get("vix"),
-        "risk_regime": macro.get("risk_regime"),
+        "cot_bias": get_cot_bias(symbol),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-
-# ─── MAIN ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
