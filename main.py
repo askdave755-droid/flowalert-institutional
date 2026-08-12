@@ -1,16 +1,17 @@
 """
 FlowAlert Institutional v3.4 — Unkillable
-Hardcoded COT. No FRED. No DB. Zero external dependencies.
+Hardcoded COT. No FRED. No DB. Minimal Pydantic.
 """
 
 import os
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 app = FastAPI(title="FlowAlert Institutional", version="3.4.0")
 app.add_middleware(
@@ -24,65 +25,41 @@ app.add_middleware(
 
 SYMBOLS = {
     "MES": {
-        "enabled": True,
-        "tick_value": 1.25,
-        "tick_size": 0.25,
-        "avg_daily_range_ticks": 120,
-        "cot_weight": 0.20,
-        "session_start": "09:30",
-        "session_end": "16:00",
+        "enabled": True, "tick_value": 1.25, "tick_size": 0.25,
+        "avg_daily_range_ticks": 120, "cot_weight": 0.20,
+        "session_start": "09:30", "session_end": "16:00",
         "lunch_ban": ("12:00", "13:30"),
-        "max_trades": 3,
-        "stop_ticks": 10,
-        "target_ticks": 20,
-        "atr_mult": 1.0,
+        "max_trades": 3, "stop_ticks": 10, "target_ticks": 20, "atr_mult": 1.0,
     },
     "NQ": {
-        "enabled": True,
-        "tick_value": 5.0,
-        "tick_size": 0.25,
-        "avg_daily_range_ticks": 200,
-        "cot_weight": 0.15,
-        "session_start": "09:30",
-        "session_end": "16:00",
+        "enabled": True, "tick_value": 5.0, "tick_size": 0.25,
+        "avg_daily_range_ticks": 200, "cot_weight": 0.15,
+        "session_start": "09:30", "session_end": "16:00",
         "lunch_ban": ("12:00", "13:30"),
-        "max_trades": 2,
-        "stop_ticks": 15,
-        "target_ticks": 30,
-        "atr_mult": 1.5,
+        "max_trades": 2, "stop_ticks": 15, "target_ticks": 30, "atr_mult": 1.5,
     },
     "MCL": {
-        "enabled": True,
-        "tick_value": 1.0,
-        "tick_size": 0.01,
-        "avg_daily_range_ticks": 300,
-        "cot_weight": 0.25,
-        "session_start": "10:00",
-        "session_end": "12:00",
+        "enabled": True, "tick_value": 1.0, "tick_size": 0.01,
+        "avg_daily_range_ticks": 300, "cot_weight": 0.25,
+        "session_start": "10:00", "session_end": "12:00",
         "lunch_ban": None,
-        "max_trades": 2,
-        "stop_ticks": 20,
-        "target_ticks": 40,
-        "atr_mult": 1.2,
-        "eia_day": 3,
-        "eia_time": "10:30",
+        "max_trades": 2, "stop_ticks": 20, "target_ticks": 40, "atr_mult": 1.2,
+        "eia_day": 3, "eia_time": "10:30",
     },
 }
 
-# HARDCODED COT — never needs reloading
 COT_DATA = {
-    "MES": {"commercial_long": 1144294, "commercial_short": 203822, "noncommercial_long": 135454, "noncommercial_short": 500456, "bias": "bullish"},
-    "NQ": {"commercial_long": 106744, "commercial_short": 32681, "noncommercial_long": 47577, "noncommercial_short": 111740, "bias": "bullish"},
-    "MCL": {"commercial_long": 41017, "commercial_short": 255805, "noncommercial_long": 227310, "noncommercial_short": 40628, "bias": "bearish"},
+    "MES": {"bias": "bullish"},
+    "NQ": {"bias": "bullish"},
+    "MCL": {"bias": "bearish"},
 }
 
-# In-memory only
 _price_cache: Dict[str, List[Dict]] = {}
 _last_analysis: Dict[str, Dict] = {}
 _trade_log: List[Dict] = []
 _daily_stats: Dict[str, Dict] = {}
 
-# ─── TIME FILTERS ───────────────────────────────────────────────────────────
+# ─── TIME FILTERS ─────────────────────────────────────────────────────────
 
 def check_time_filters(symbol: str) -> tuple[bool, str]:
     cfg = SYMBOLS.get(symbol)
@@ -112,18 +89,13 @@ def check_time_filters(symbol: str) -> tuple[bool, str]:
     if symbol == "MCL":
         eia_day = cfg.get("eia_day", 3)
         if et_weekday == eia_day:
-            eia_time = cfg.get("eia_time", "10:30")
             if not ("10:25" <= et_time <= "11:00"):
                 return False, "MCL: Waiting for EIA 10:30 AM"
 
     return True, "OK"
 
-# ─── COT ────────────────────────────────────────────────────────────────────
-
 def get_cot_bias(symbol: str) -> str:
     return COT_DATA.get(symbol, {}).get("bias", "neutral")
-
-# ─── RISK ───────────────────────────────────────────────────────────────────
 
 def check_daily_limits(symbol: str) -> tuple[bool, str]:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -138,7 +110,7 @@ def check_daily_limits(symbol: str) -> tuple[bool, str]:
         return False, f"Daily loss limit hit (${stats['daily_pnl']:.0f})"
     return True, "OK"
 
-# ─── SIX FILTER (Pure Python) ───────────────────────────────────────────────
+# ─── SIX FILTER (Pure Python) ───────────────────────────────────────────
 
 class SixFilterEngine:
     def __init__(self, symbol: str, bars: List[Dict]):
@@ -305,7 +277,7 @@ class SixFilterEngine:
             "atr_ticks": round(atr_ticks, 1),
         }
 
-# ─── MODELS ─────────────────────────────────────────────────────────────────
+# ─── MODELS (Minimal) ─────────────────────────────────────────────────────
 
 class BarData(BaseModel):
     open: float
@@ -315,7 +287,7 @@ class BarData(BaseModel):
     volume: int = 0
 
 class AnalyzeRequest(BaseModel):
-    symbol: str = Field(..., pattern="^(MES|NQ|MCL)$")
+    symbol: str
     bars: List[BarData]
 
 class IngestPriceRequest(BaseModel):
@@ -328,7 +300,7 @@ class TradeResultRequest(BaseModel):
     exit_price: float
     pnl: float
 
-# ─── ENDPOINTS ──────────────────────────────────────────────────────────────
+# ─── ENDPOINTS ────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -344,6 +316,9 @@ async def health():
 @app.post("/ingest-price")
 async def ingest_price(request: IngestPriceRequest):
     symbol = request.symbol.upper()
+    if symbol not in SYMBOLS:
+        return {"status": "error", "message": f"Invalid symbol: {symbol}"}
+
     time_ok, time_reason = check_time_filters(symbol)
     if not time_ok:
         _last_analysis[symbol] = {
@@ -372,8 +347,11 @@ async def ingest_price(request: IngestPriceRequest):
     return {"status": "ok", "bars_received": len(request.bars)}
 
 @app.get("/signal")
-async def get_signal(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$")):
+async def get_signal(symbol: str = Query(default="MES")):
     symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        return {"error": "Invalid symbol"}
+
     time_ok, time_reason = check_time_filters(symbol)
     if not time_ok:
         return {
@@ -405,6 +383,9 @@ async def get_signal(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$")):
 @app.post("/analyze")
 async def analyze(request: AnalyzeRequest):
     symbol = request.symbol.upper()
+    if symbol not in SYMBOLS:
+        return {"error": "Invalid symbol"}
+
     time_ok, time_reason = check_time_filters(symbol)
     if not time_ok:
         return {"symbol": symbol, "direction": "NONE", "reason": time_reason, "confidence": 0}
@@ -419,7 +400,7 @@ async def analyze(request: AnalyzeRequest):
     signal = engine.run_all(cot_bias)
 
     if signal["direction"] != "NONE":
-        trade_id = str(__import__("uuid").uuid4())
+        trade_id = str(uuid.uuid4())
         signal["trade_id"] = trade_id
         _trade_log.append({
             "id": trade_id, "symbol": symbol, "direction": signal["direction"],
@@ -454,11 +435,14 @@ async def trade_result(request: TradeResultRequest):
     return {"status": "ok", "trade_id": request.trade_id, "pnl": request.pnl}
 
 @app.post("/update-cot")
-async def update_cot(request: Dict[str, Any]):
+async def update_cot(request: Request):
     return {"status": "ok", "note": "COT is hardcoded — no update needed", "hardcoded_bias": {s: COT_DATA[s]["bias"] for s in COT_DATA}}
 
 @app.get("/signal-debug")
-async def signal_debug(symbol: str = Query(..., pattern="^(MES|NQ|MCL)$")):
+async def signal_debug(symbol: str = Query(default="MES")):
+    symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        return {"error": "Invalid symbol"}
     time_ok, time_reason = check_time_filters(symbol)
     limit_ok, limit_reason = check_daily_limits(symbol)
     return {
