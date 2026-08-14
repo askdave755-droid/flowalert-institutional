@@ -1,6 +1,6 @@
 """
-FlowAlert Institutional v3.4 — Unkillable
-Hardcoded COT. No FRED. No DB. Minimal Pydantic.
+FlowAlert Institutional v3.4.1 — Runtime Fix
+Fixes NameError on divergence variable.
 """
 
 import os
@@ -13,7 +13,7 @@ from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="FlowAlert Institutional", version="3.4.0")
+app = FastAPI(title="FlowAlert Institutional", version="3.4.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -177,14 +177,17 @@ class SixFilterEngine:
         last = self.closes[-1]
         ema20 = self.ema(20)
 
+        # Filter 1: LMSR
         deviation = (last - vwap) / vwap if vwap != 0 else 0
         threshold = 0.001 * self.config["atr_mult"]
         f1_passed = abs(deviation) > threshold
         f1_dir = "LONG" if deviation < -threshold else "SHORT" if deviation > threshold else "NEUTRAL"
 
+        # Filter 2: Kelly
         kelly_f = 0.15
         f2_passed = True
 
+        # Filter 3: EV Gap
         atr_ticks = self.atr()
         stop_ticks = self.config["stop_ticks"]
         target_ticks = self.config["target_ticks"]
@@ -192,9 +195,10 @@ class SixFilterEngine:
         ev = (0.55 * target_ticks - 0.45 * stop_ticks) * self.config["tick_value"]
         f3_passed = rr_calc >= 2.0 and ev > 0
 
+        # Filter 4: KL Divergence — FIX: initialize divergence BEFORE if block
         f4_passed = False
         f4_dir = "NEUTRAL"
-        divergence = 0
+        divergence = 0.0  # <-- THIS WAS THE BUG: not initialized before
         if len(self.closes) >= 20:
             price_change = (self.closes[-1] - self.closes[-10]) / self.closes[-10] if self.closes[-10] != 0 else 0
             rsi_now = self.rsi()
@@ -202,6 +206,7 @@ class SixFilterEngine:
             f4_passed = abs(divergence) > 0.02
             f4_dir = "SHORT" if divergence > 0 else "LONG" if divergence < 0 else "NEUTRAL"
 
+        # Filter 5: Bayesian
         prior = 0.5
         if cot_bias == "bullish":
             prior *= 1.15
@@ -216,6 +221,7 @@ class SixFilterEngine:
         posterior = min(prior, 0.95)
         f5_passed = posterior > 0.55
 
+        # Filter 6: Stoikov
         zone_low = min(vwap, ema20) * 0.999
         zone_high = max(vwap, ema20) * 1.001
         in_zone = zone_low <= last <= zone_high
@@ -306,7 +312,7 @@ class TradeResultRequest(BaseModel):
 async def health():
     return {
         "status": "ok",
-        "version": "3.4.0",
+        "version": "3.4.1",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "symbols": {s: {"enabled": c["enabled"]} for s, c in SYMBOLS.items()},
         "cot": {s: COT_DATA[s]["bias"] for s in COT_DATA},
@@ -337,11 +343,14 @@ async def ingest_price(request: IngestPriceRequest):
         signal = engine.run_all(cot_bias)
         _last_analysis[symbol] = signal
     except Exception as e:
+        import traceback
+        error_msg = str(e) + " | " + traceback.format_exc().replace("\n", " ")[:200]
         _last_analysis[symbol] = {
             "symbol": symbol, "direction": "NONE", "raw_direction": "NONE",
             "confidence": 0, "filters_passed": 0, "filters_total": 6,
             "entry_price": None, "stop_price": None, "target_price": None,
             "size": 1, "filter_details": [], "vwap": 0, "ema20": 0, "atr_ticks": 0,
+            "error": error_msg,
         }
 
     return {"status": "ok", "bars_received": len(request.bars)}
@@ -370,7 +379,7 @@ async def get_signal(symbol: str = Query(default="MES")):
             "stop_price": sig.get("stop_price", 0) or 0,
             "target_price": sig.get("target_price", 0) or 0,
             "size_multiplier": 1.0,
-            "reason": "",
+            "reason": sig.get("error", ""),
         }
 
     return {
